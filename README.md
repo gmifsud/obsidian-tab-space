@@ -1,5 +1,11 @@
 # Working tabs
 
+<p align="center">
+  <a href="https://github.com/NoteNerdOfficial/working-tabs/commits/main"><img src="https://img.shields.io/github/last-commit/NoteNerdOfficial/working-tabs?style=flat-square" alt="last commit"></a>
+  <a href="https://github.com/NoteNerdOfficial/working-tabs/releases/latest"><img src="https://img.shields.io/github/v/release/NoteNerdOfficial/working-tabs?style=flat-square&label=release" alt="release"></a>
+  <a href="https://obsidian.md/plugins?id=working-tabs"><img src="https://img.shields.io/badge/dynamic/json?style=flat-square&logo=obsidian&color=7C3AED&label=downloads&query=%24%5B%22working-tabs%22%5D.downloads&url=https%3A%2F%2Fraw.githubusercontent.com%2Fobsidianmd%2Fobsidian-releases%2Fmaster%2Fcommunity-plugin-stats.json" alt="Obsidian downloads"></a>
+</p>
+
 Your open tabs, organized by what you're working on *right now* — not by folder, and not by layout. Inspired by Workona, built for Obsidian.
 
 <p align="center">
