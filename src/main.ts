@@ -21,6 +21,7 @@ export default class TabSpacesPlugin extends Plugin {
 			this.store.onChange(() => {
 				this.applyHideTabHeaders();
 				this.leafSync.refreshAccents();
+				this.leafSync.refreshHidden();
 			})
 		);
 

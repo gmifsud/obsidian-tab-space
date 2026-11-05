@@ -60,7 +60,9 @@ export interface SpaceNode {
 
 	/** Groups only -- how this group's tabs get opened when activated. */
 	openBehavior?: OpenBehavior;
-	/** Groups only -- the pane (WorkspaceLeaf id) this group last occupied, reused if still valid. */
+	/** Groups only -- the WorkspaceTabs pane id this group claims while live. */
+	homePaneId?: string;
+	/** Legacy leaf-anchor claim; cleared on first reconcile after load (replaced by homePaneId). */
 	homeLeafId?: string;
 	/** Groups and sections. For a group: when true, its pane is hidden from
 	 * the main workspace (not closed, still open in the background -- see
@@ -144,6 +146,8 @@ export interface TabSpacesSettings {
 export interface TabSpacesData {
 	items: SpaceNode[];
 	settings: TabSpacesSettings;
+	/** At most one section is focused; null/absent means none. */
+	focusedSectionId?: string | null;
 }
 
 export const DEFAULT_SETTINGS: TabSpacesSettings = {

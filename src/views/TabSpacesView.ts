@@ -178,12 +178,21 @@ export class TabSpacesView extends ItemView {
 		// between the blocks as a pair: "New group" closes out the groups it
 		// appends to, "Create a section" heads the sections block it appends
 		// to, so both containers read as peers you can make from one spot.
+		// While a section is focused it renders first among sections.
+		const focusedSectionId = this.store.focusedSectionId;
 		for (const node of roots.filter((n) => n.type === 'group')) this.renderNode(this.treeEl, node, 0, false, query);
 		if (!query) {
 			this.renderNewGroupRow();
 			this.renderCreateSectionRow();
 		}
-		for (const node of roots.filter((n) => n.type === 'section')) this.renderNode(this.treeEl, node, 0, false, query);
+		const sections = roots.filter((n) => n.type === 'section');
+		const orderedSections = focusedSectionId
+			? [
+					...sections.filter((n) => n.id === focusedSectionId),
+					...sections.filter((n) => n.id !== focusedSectionId),
+				]
+			: sections;
+		for (const node of orderedSections) this.renderNode(this.treeEl, node, 0, false, query);
 
 		this.treeEl.createDiv({ cls: 'working-tabs-divider' });
 
@@ -229,18 +238,19 @@ export class TabSpacesView extends ItemView {
 	}
 
 	private renderSection(parentEl: HTMLElement, node: SpaceNode, depth: number, query: string): void {
+		const focused = this.store.focusedSectionId === node.id;
+		const somethingFocused = Boolean(this.store.focusedSectionId);
 		const wrapper = parentEl.createDiv({ cls: 'working-tabs-section' });
 		const row = this.renderRowShell(
 			wrapper,
 			node,
 			depth,
-			`working-tabs-section-header${node.hidden ? ' is-hidden-pane' : ''}`
+			`working-tabs-section-header${node.hidden ? ' is-hidden-pane' : ''}${focused ? ' is-focused-section' : ''}`
 		);
 
-		// Force-expanded during a search to reveal the match inside, same as a
-		// group below -- collapsed state underneath is untouched and resumes
-		// once the search is cleared.
-		const expanded = query ? true : !node.collapsed;
+		// Force-expanded during a search / while focused. Other sections render
+		// collapsed while something is focused (stored collapsed flags untouched).
+		const expanded = query ? true : focused ? true : somethingFocused ? false : !node.collapsed;
 		const chevron = row.createDiv({ cls: 'working-tabs-chevron' });
 		setIcon(chevron, expanded ? 'chevron-down' : 'chevron-right');
 
@@ -248,11 +258,21 @@ export class TabSpacesView extends ItemView {
 		const title = textCol.createSpan({ cls: 'working-tabs-title' });
 		title.setText(node.title);
 		this.wireRename(title, node);
+		if (focused) textCol.createSpan({ cls: 'working-tabs-focus-badge', text: 'focused' });
 		if (node.description) {
 			textCol.createDiv({ cls: 'working-tabs-description', text: node.description });
 		}
 
 		const actions = row.createDiv({ cls: 'working-tabs-row-actions' });
+		this.makeGroupActionButton(
+			actions,
+			'crosshair',
+			focused ? 'Unfocus section' : 'Focus section',
+			(evt) => {
+				evt.stopPropagation();
+				void this.store.setFocusedSection(focused ? null : node.id);
+			}
+		);
 		this.makeGroupActionButton(
 			actions,
 			node.hidden ? 'eye-off' : 'eye',
@@ -283,7 +303,7 @@ export class TabSpacesView extends ItemView {
 	}
 
 	private isLive(node: SpaceNode): boolean {
-		return Boolean(node.homeLeafId) && Boolean(this.app.workspace.getLeafById(node.homeLeafId as string));
+		return this.plugin.leafSync.isLive(node.id);
 	}
 
 	private renderGroup(parentEl: HTMLElement, node: SpaceNode, depth: number, isCompleted: boolean, query: string): void {
@@ -330,6 +350,16 @@ export class TabSpacesView extends ItemView {
 						item.setTitle(label).onClick(() => void this.plugin.leafSync.openGroup(node.id, behavior))
 					);
 				}
+				menu.addSeparator();
+				menu.addItem((item) =>
+					item.setTitle('Open in current pane (merge)').onClick(() => {
+						const active = this.app.workspace.getMostRecentLeaf();
+						const paneId = active
+							? (active.parent as unknown as { id?: string } | null)?.id
+							: undefined;
+						if (paneId) void this.plugin.leafSync.mergeGroupInto(node.id, paneId);
+					})
+				);
 				menu.showAtMouseEvent(evt);
 			});
 		}
@@ -766,6 +796,31 @@ export class TabSpacesView extends ItemView {
 
 	private showSectionMenu(node: SpaceNode, evt: MouseEvent): void {
 		const menu = new Menu();
+		const focused = this.store.focusedSectionId === node.id;
+		menu.addItem((item) =>
+			item.setTitle(focused ? 'Unfocus' : 'Focus').setIcon('crosshair').onClick(() => {
+				void this.store.setFocusedSection(focused ? null : node.id);
+			})
+		);
+		menu.addItem((item) =>
+			item.setTitle('Open all').setIcon('folder-open').onClick(() => {
+				for (const child of this.store.children(node.id)) {
+					if (child.type === 'group' && !this.plugin.leafSync.isLive(child.id)) {
+						void this.plugin.leafSync.openGroup(child.id);
+					}
+				}
+			})
+		);
+		menu.addItem((item) =>
+			item.setTitle('Close all').setIcon('x').onClick(() => {
+				for (const child of this.store.children(node.id)) {
+					if (child.type === 'group' && this.plugin.leafSync.isLive(child.id)) {
+						void this.plugin.leafSync.closeGroup(child.id);
+					}
+				}
+			})
+		);
+		menu.addSeparator();
 		menu.addItem((item) =>
 			item.setTitle('Rename').setIcon('pencil').onClick(() => {
 				const titleEl = this.treeEl.querySelector<HTMLElement>(`[data-node-id="${node.id}"] .working-tabs-title`);
@@ -820,6 +875,15 @@ export class TabSpacesView extends ItemView {
 					item.setTitle('Close group').setIcon('x').onClick(() => void this.plugin.leafSync.closeGroup(node.id))
 				);
 			}
+			const undoReceipt = this.plugin.leafSync.receiptForTarget(node.id);
+			if (undoReceipt) {
+				menu.addItem((item) =>
+					item
+						.setTitle('Undo last merge')
+						.setIcon('undo')
+						.onClick(() => void this.plugin.leafSync.undoMerge(undoReceipt))
+				);
+			}
 		}
 		menu.addSeparator();
 		menu.addItem((item) =>
@@ -861,10 +925,16 @@ export class TabSpacesView extends ItemView {
 			item.setTitle(node.done ? 'Mark not done' : 'Mark done').setIcon('check').onClick(() => void this.store.toggleDone(node.id))
 		);
 		menu.addSeparator();
+		menu.addItem((item) =>
+			item
+				.setTitle('Move to new group')
+				.setIcon('plus-square')
+				.onClick(() => void this.plugin.leafSync.moveTabToNewGroup(node))
+		);
 		for (const group of this.store.items.filter((n) => n.type === 'group' && n.id !== node.parentId)) {
 			menu.addItem((item) =>
 				item.setTitle(`Move to: ${group.title}`).setIcon('folder').onClick(() => {
-					void this.store.moveInto(node.id, group.id, this.store.children(group.id).length);
+					void this.plugin.leafSync.moveTab(node, group.id, this.store.children(group.id).length);
 				})
 			);
 		}
@@ -945,10 +1015,24 @@ export class TabSpacesView extends ItemView {
 	}
 
 	private async handleDrop(dragged: SpaceNode, target: SpaceNode, position: DropPosition): Promise<void> {
+		if (dragged.type === 'tab') {
+			if (position === 'into' && target.type === 'group') {
+				const index = this.store.children(target.id).filter((n) => n.id !== dragged.id).length;
+				await this.plugin.leafSync.moveTab(dragged, target.id, index);
+				return;
+			}
+			if (!target.parentId) return;
+			const siblings = this.store.children(target.parentId).filter((n) => n.id !== dragged.id);
+			let index = siblings.findIndex((n) => n.id === target.id);
+			if (index === -1) index = siblings.length;
+			if (position === 'after') index += 1;
+			await this.plugin.leafSync.moveTab(dragged, target.parentId, index);
+			return;
+		}
+
 		if (position === 'into') {
 			const index = this.store.children(target.id).filter((n) => n.id !== dragged.id).length;
 			await this.store.moveInto(dragged.id, target.id, index);
-			await this.afterTabMove(dragged);
 			return;
 		}
 		const siblings = this.store.children(target.parentId).filter((n) => n.id !== dragged.id);
@@ -956,13 +1040,6 @@ export class TabSpacesView extends ItemView {
 		if (index === -1) index = siblings.length;
 		if (position === 'after') index += 1;
 		await this.store.moveInto(dragged.id, target.parentId, index);
-		await this.afterTabMove(dragged);
-	}
-
-	/** A drag that reorders or reparents a tab should be reflected in the
-	 * actual Obsidian tab strip too, not just the sidebar. */
-	private async afterTabMove(node: SpaceNode): Promise<void> {
-		if (node.type === 'tab') await this.plugin.leafSync.relocateLiveLeaf(node);
 	}
 
 	private registerRootDropZone(treeEl: HTMLElement): void {
@@ -1010,6 +1087,7 @@ export class TabSpacesView extends ItemView {
 
 		const clearPaneMarker = () => {
 			this.paneDropMarkedEl?.removeClass(...PANE_DROP_CLASSES);
+			this.paneDropMarkedEl?.removeAttribute('data-working-tabs-merge-target');
 			this.paneDropMarkedEl = null;
 		};
 
@@ -1030,7 +1108,18 @@ export class TabSpacesView extends ItemView {
 			const zone = resolveZone(paneEl, evt);
 			if (this.paneDropMarkedEl && this.paneDropMarkedEl !== paneEl) clearPaneMarker();
 			paneEl.removeClass(...PANE_DROP_CLASSES);
+			paneEl.removeAttribute('data-working-tabs-merge-target');
 			paneEl.addClass(`working-tabs-pane-drop-${zone}`);
+			if (zone === 'center') {
+				const targetLeaf = this.findLeafForPaneEl(paneEl);
+				const paneId = targetLeaf
+					? (targetLeaf.parent as unknown as { id?: string } | null)?.id
+					: undefined;
+				const owner = paneId
+					? this.store.items.find((n) => n.type === 'group' && n.homePaneId === paneId)
+					: undefined;
+				if (owner) paneEl.setAttribute('data-working-tabs-merge-target', `Merge into ${owner.title}`);
+			}
 			this.paneDropMarkedEl = paneEl;
 		});
 

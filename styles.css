@@ -229,6 +229,18 @@ body {
 	text-align: center;
 }
 
+.working-tabs-focus-badge {
+	flex: 0 0 auto;
+	font-size: 10px;
+	color: var(--text-accent);
+	text-transform: lowercase;
+	letter-spacing: 0.02em;
+}
+
+.working-tabs-section-header.is-focused-section .working-tabs-title {
+	color: var(--interactive-accent, #7c6ff0);
+}
+
 /* A group's pane is currently open. */
 .working-tabs-group-header.is-live .working-tabs-title {
 	color: var(--interactive-accent, #7c6ff0);
@@ -481,6 +493,18 @@ body:not(.is-phone) .workspace-split.mod-root .workspace-split:not(:has(.workspa
 	left: 10%;
 	right: 10%;
 	border-radius: 8px;
+}
+
+.workspace-tabs.working-tabs-pane-drop-center[data-working-tabs-merge-target]::after {
+	content: attr(data-working-tabs-merge-target);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	color: var(--text-on-accent, #fff);
+	font-size: var(--font-ui-small);
+	font-weight: var(--font-semibold);
+	opacity: 0.9;
+	background-color: color-mix(in srgb, var(--interactive-accent, #7c6ff0) 70%, transparent);
 }
 
 /* Drag affordance and drop indicators */

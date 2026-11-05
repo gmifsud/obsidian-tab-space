@@ -34,6 +34,7 @@ export class TabSpacesStore {
 		this.data = {
 			items: saved?.items ?? DEFAULT_DATA.items,
 			settings: { ...DEFAULT_SETTINGS, ...(saved?.settings ?? {}) },
+			focusedSectionId: saved?.focusedSectionId ?? null,
 		};
 		// One-time migration: anything still filed under the retired Unsorted
 		// bucket becomes a normal root-level group/tab, same as everything else.
@@ -263,6 +264,19 @@ export class TabSpacesStore {
 		return node;
 	}
 
+	/** Re-inserts a group node (e.g. merge undo) with its existing id. */
+	async insertGroup(node: SpaceNode): Promise<void> {
+		if (node.type !== 'group' || this.find(node.id)) return;
+		const parentId = node.parentId && this.find(node.parentId) ? node.parentId : null;
+		node.parentId = parentId;
+		node.homePaneId = undefined;
+		node.homeLeafId = undefined;
+		node.order = this.nextOrder(parentId);
+		this.data.items.push(node);
+		await this.save();
+		this.notify();
+	}
+
 	async addTab(
 		groupId: string,
 		tabKey: string,
@@ -394,11 +408,35 @@ export class TabSpacesStore {
 		this.notify();
 	}
 
-	/** Tracks the pane a group is currently occupying; cleared once the pane closes. */
-	async setHomeLeaf(id: string, leafId: string | undefined): Promise<void> {
+	/** Tracks the pane a group currently claims; cleared once the pane closes. */
+	async setHomePane(id: string, paneId: string | undefined): Promise<void> {
 		const node = this.find(id);
 		if (!node || node.type !== 'group') return;
-		node.homeLeafId = leafId;
+		node.homePaneId = paneId;
+		node.homeLeafId = undefined;
+		await this.save();
+		this.notify();
+	}
+
+	/** Reparents a tab into another group, preserving id and all tab fields. */
+	async moveTabRecord(tabId: string, toGroupId: string): Promise<void> {
+		const tab = this.find(tabId);
+		if (!tab || tab.type !== 'tab') return;
+		const target = this.find(toGroupId);
+		if (!target || target.type !== 'group') return;
+		tab.parentId = toGroupId;
+		tab.order = this.nextOrder(toGroupId);
+		await this.save();
+		this.notify();
+	}
+
+	get focusedSectionId(): string | null {
+		return this.data.focusedSectionId ?? null;
+	}
+
+	async setFocusedSection(id: string | null): Promise<void> {
+		if (this.data.focusedSectionId === id) return;
+		this.data.focusedSectionId = id;
 		await this.save();
 		this.notify();
 	}
@@ -409,10 +447,6 @@ export class TabSpacesStore {
 		node.hidden = !node.hidden;
 		await this.save();
 		this.notify();
-	}
-
-	groupByHomeLeaf(leafId: string): SpaceNode | undefined {
-		return this.data.items.find((i) => i.type === 'group' && i.homeLeafId === leafId);
 	}
 
 	/** Removes a node. If it's a group/section, its descendants are removed too. */
@@ -495,10 +529,6 @@ export class TabSpacesStore {
 		this.notify();
 	}
 
-	get completed(): SpaceNode[] {
-		return this.children(COMPLETED_PARENT_ID);
-	}
-
 	/**
 	 * Marks a group done: remembers where it lived (so Restore can put it
 	 * back), moves it under the reserved COMPLETED_PARENT_ID bucket. Does not
@@ -508,6 +538,7 @@ export class TabSpacesStore {
 		const node = this.find(id);
 		if (!node || node.type !== 'group') return;
 		node.lastParentId = node.parentId;
+		node.homePaneId = undefined;
 		node.homeLeafId = undefined;
 		node.completedAt = Date.now();
 		await this.moveInto(id, COMPLETED_PARENT_ID, this.children(COMPLETED_PARENT_ID).length);
