@@ -427,6 +427,8 @@ var TabSpacesStore = class {
     const node = this.find(id);
     if (!node || node.type !== "group")
       return;
+    if (node.homePaneId === paneId && !node.homeLeafId)
+      return;
     node.homePaneId = paneId;
     node.homeLeafId = void 0;
     await this.save();
@@ -1752,6 +1754,8 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
     this.unsubscribe = null;
     this.visibleOrder = [];
     this.focusedId = null;
+    /** While set, store-driven re-renders are deferred so the inline rename input isn't destroyed mid-edit. */
+    this.renamingId = null;
     this.completedCollapsed = true;
     this.searchQuery = "";
     this.store = plugin.store;
@@ -1787,7 +1791,11 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
     this.registerRootDropZone(this.treeEl);
     this.registerWorkspaceDropZones();
     this.treeEl.addEventListener("keydown", (evt) => this.handleKeydown(evt));
-    this.unsubscribe = this.store.onChange(() => this.render());
+    this.unsubscribe = this.store.onChange(() => {
+      if (this.renamingId)
+        return;
+      this.render();
+    });
     this.registerEvent(
       this.app.workspace.on("active-leaf-change", (leaf) => {
         const tab = leaf && this.plugin.leafSync.findTabForLeaf(leaf);
@@ -2315,6 +2323,9 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
     });
   }
   startRename(title, node) {
+    if (this.renamingId)
+      return;
+    this.renamingId = node.id;
     const parent = title.parentElement;
     const input = parent.createEl("input", { cls: "working-tabs-rename-input" });
     input.type = "text";
@@ -2324,13 +2335,17 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
     input.focus();
     input.select();
     const finish = async (commit) => {
+      if (this.renamingId !== node.id)
+        return;
       input.removeEventListener("blur", onBlur);
       input.removeEventListener("keydown", onKeydown);
+      this.renamingId = null;
       const value = input.value.trim();
       if (commit && value && value !== node.title) {
         await this.store.rename(node.id, value);
       } else {
         input.replaceWith(title);
+        this.render();
       }
     };
     const onBlur = () => void finish(true);

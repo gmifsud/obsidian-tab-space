@@ -48,6 +48,8 @@ export class TabSpacesView extends ItemView {
 	private unsubscribe: (() => void) | null = null;
 	private visibleOrder: string[] = [];
 	private focusedId: string | null = null;
+	/** While set, store-driven re-renders are deferred so the inline rename input isn't destroyed mid-edit. */
+	private renamingId: string | null = null;
 	private completedCollapsed = true;
 	private searchInputEl!: HTMLInputElement;
 	private searchQuery = '';
@@ -97,7 +99,10 @@ export class TabSpacesView extends ItemView {
 		this.registerWorkspaceDropZones();
 		this.treeEl.addEventListener('keydown', (evt) => this.handleKeydown(evt));
 
-		this.unsubscribe = this.store.onChange(() => this.render());
+		this.unsubscribe = this.store.onChange(() => {
+			if (this.renamingId) return;
+			this.render();
+		});
 		this.registerEvent(
 			this.app.workspace.on('active-leaf-change', (leaf) => {
 				const tab = leaf && this.plugin.leafSync.findTabForLeaf(leaf);
@@ -681,6 +686,9 @@ export class TabSpacesView extends ItemView {
 	}
 
 	private startRename(title: HTMLElement, node: SpaceNode): void {
+		if (this.renamingId) return;
+		this.renamingId = node.id;
+
 		const parent = title.parentElement as HTMLElement;
 		const input = parent.createEl('input', { cls: 'working-tabs-rename-input' });
 		input.type = 'text';
@@ -691,13 +699,17 @@ export class TabSpacesView extends ItemView {
 		input.select();
 
 		const finish = async (commit: boolean) => {
+			if (this.renamingId !== node.id) return;
 			input.removeEventListener('blur', onBlur);
 			input.removeEventListener('keydown', onKeydown);
+			this.renamingId = null;
 			const value = input.value.trim();
 			if (commit && value && value !== node.title) {
 				await this.store.rename(node.id, value);
 			} else {
 				input.replaceWith(title);
+				// Catch up on any store changes deferred while the input was open.
+				this.render();
 			}
 		};
 		const onBlur = () => void finish(true);

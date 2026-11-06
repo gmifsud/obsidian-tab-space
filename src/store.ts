@@ -412,6 +412,9 @@ export class TabSpacesStore {
 	async setHomePane(id: string, paneId: string | undefined): Promise<void> {
 		const node = this.find(id);
 		if (!node || node.type !== 'group') return;
+		// Reconcile re-asserts claims every pass -- no-op when nothing changed so
+		// we don't notify (and re-render the sidebar) on a quiet poll tick.
+		if (node.homePaneId === paneId && !node.homeLeafId) return;
 		node.homePaneId = paneId;
 		node.homeLeafId = undefined;
 		await this.save();
