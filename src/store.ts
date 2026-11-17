@@ -427,6 +427,7 @@ export class TabSpacesStore {
 		if (!tab || tab.type !== 'tab') return;
 		const target = this.find(toGroupId);
 		if (!target || target.type !== 'group') return;
+		if (tab.parentId === toGroupId) return;
 		tab.parentId = toGroupId;
 		tab.order = this.nextOrder(toGroupId);
 		await this.save();

@@ -442,6 +442,8 @@ var TabSpacesStore = class {
     const target = this.find(toGroupId);
     if (!target || target.type !== "group")
       return;
+    if (tab.parentId === toGroupId)
+      return;
     tab.parentId = toGroupId;
     tab.order = this.nextOrder(toGroupId);
     await this.save();
@@ -560,12 +562,10 @@ function isBlankTab(tab) {
   const type = (_a = tab.viewState) == null ? void 0 : _a.type;
   return !type || type === "empty";
 }
-function effectivelyHidden(group, section, focusedSectionId) {
+function effectivelyHidden(group, section) {
   if (group.hidden)
     return true;
   if (section == null ? void 0 : section.hidden)
-    return true;
-  if (focusedSectionId && group.parentId !== focusedSectionId)
     return true;
   return false;
 }
@@ -576,7 +576,7 @@ function plan(snapshot, nodes, ctx) {
   var _a;
   const entries = [];
   const paneById = new Map(snapshot.panes.map((p) => [p.paneId, p]));
-  const paneIds = new Set(paneById.keys());
+  const paneIds2 = new Set(paneById.keys());
   const tabs = nodes.filter((n) => n.type === "tab");
   const tabByKey = /* @__PURE__ */ new Map();
   for (const tab of tabs) {
@@ -592,7 +592,7 @@ function plan(snapshot, nodes, ctx) {
   const claimByGroup = /* @__PURE__ */ new Map();
   const claimByPane = /* @__PURE__ */ new Map();
   for (const g of groups) {
-    if (g.homePaneId && paneIds.has(g.homePaneId)) {
+    if (g.homePaneId && paneIds2.has(g.homePaneId)) {
       claimByGroup.set(g.id, g.homePaneId);
       claimByPane.set(g.homePaneId, g.id);
     }
@@ -613,7 +613,7 @@ function plan(snapshot, nodes, ctx) {
   for (const g of groups) {
     if (!g.homePaneId)
       continue;
-    if (paneIds.has(g.homePaneId)) {
+    if (paneIds2.has(g.homePaneId)) {
       entries.push({ kind: "claimPane", groupId: g.id, paneId: g.homePaneId });
     } else {
       entries.push({ kind: "releasePane", groupId: g.id });
@@ -651,6 +651,41 @@ function plan(snapshot, nodes, ctx) {
       claimByPane.set(pane.paneId, g.id);
       break;
     }
+  }
+  for (const g of groups) {
+    if (claimByGroup.has(g.id) || !g.homePaneId)
+      continue;
+    const nonDone = childrenOf(nodes, g.id).filter((t) => !t.done && t.tabKey);
+    if (nonDone.length === 0)
+      continue;
+    const hosts = snapshot.panes.filter((pane) => {
+      const keys = new Set(pane.leaves.map((l) => l.identity.key));
+      return nonDone.every((t) => keys.has(t.tabKey));
+    });
+    if (hosts.length !== 1)
+      continue;
+    const hostId = claimByPane.get(hosts[0].paneId);
+    if (!hostId || hostId === g.id)
+      continue;
+    const tabIds = [];
+    for (const tab of nonDone) {
+      entries.push({
+        kind: "moveTabRecord",
+        tabId: tab.id,
+        fromGroupId: g.id,
+        toGroupId: hostId
+      });
+      movedTabIds.add(tab.id);
+      effectiveParent.set(tab.id, hostId);
+      tabIds.push(tab.id);
+    }
+    entries.push({
+      kind: "merged",
+      fromGroup: { ...g },
+      toGroupId: hostId,
+      tabIds
+    });
+    entries.push({ kind: "removeGroup", groupId: g.id });
   }
   const mirrorTargets = [];
   for (const [paneId, groupId] of claimByPane) {
@@ -777,7 +812,7 @@ function plan(snapshot, nodes, ctx) {
     entries.push({
       kind: "newGroup",
       paneId: pane.paneId,
-      parentId: ctx.focusedSectionId,
+      parentId: null,
       title: ctx.nextDefaultTitle()
     });
     const gid = pendingGroupId(pane.paneId);
@@ -800,9 +835,19 @@ function plan(snapshot, nodes, ctx) {
 function getLeafId(leaf) {
   return leaf.id;
 }
+var paneIds = /* @__PURE__ */ new WeakMap();
+var paneIdSeq = 0;
 function getPaneId(leaf) {
   var _a;
-  return (_a = leaf.parent) == null ? void 0 : _a.id;
+  const parent = leaf.parent;
+  if (!parent)
+    return void 0;
+  const cached = paneIds.get(parent);
+  if (cached)
+    return cached;
+  const id = (_a = parent.id) != null ? _a : `pane:${++paneIdSeq}`;
+  paneIds.set(parent, id);
+  return id;
 }
 function titleFromPath(path) {
   var _a;
@@ -1089,9 +1134,6 @@ var LeafSync = class {
       (n) => n.type === "group" && n.id !== excludeId && n.homePaneId === paneId
     );
   }
-  isPaneOwned(paneId, excludeId) {
-    return Boolean(this.findOwningGroupByPane(paneId, excludeId));
-  }
   /**
    * Ported from Vertical Tabs' own (proven, shipped-for-years) approach:
    * toggle a class on the specific pane, then let a *declarative* CSS
@@ -1103,16 +1145,17 @@ var LeafSync = class {
    * own, with nothing but a class toggle from us, can't drift out of sync
    * with the DOM the way hand-rolled JS state can.
    */
-  /** Hidden by own flag, section hide, or being outside the focused section (D12). */
+  /** Stored hide flags. Not applied to the workspace — hiding a pane is Close. */
   isEffectivelyHidden(group) {
     const parent = group.parentId ? this.store.find(group.parentId) : void 0;
     const section = (parent == null ? void 0 : parent.type) === "section" ? parent : void 0;
-    return effectivelyHidden(group, section, this.store.focusedSectionId);
+    return effectivelyHidden(group, section);
   }
+  /** Drop a leftover hide class from older builds. The stylesheet no longer hides panes. */
   applyHiddenClass(group) {
     const leaf = this.findLeafInPane(group.homePaneId);
     const tabsEl = leaf == null ? void 0 : leaf.view.containerEl.closest(".workspace-tabs");
-    tabsEl == null ? void 0 : tabsEl.toggleClass("working-tabs-hidden-pane", this.isEffectivelyHidden(group));
+    tabsEl == null ? void 0 : tabsEl.removeClass("working-tabs-hidden-pane");
   }
   /**
    * Colour coding's half of the same mechanism: reaches the group's pane the
@@ -1186,11 +1229,29 @@ var LeafSync = class {
    * is just `createLeafBySplit(getMostRecentLeaf(), d)` under the hood), but
    * going through it directly is one less layer to trust, and matches the
    * mechanism the workspace drag-and-drop feature already uses successfully. */
+  /** Most recent leaf in the main editor, never a side dock or this sidebar. */
+  editorLeaf() {
+    const root = this.workspace.rootSplit;
+    const recent = this.workspace.getMostRecentLeaf();
+    if (recent && recent.getRoot() === root && recent.view.getViewType() !== VIEW_TYPE_WORKING_TABS)
+      return recent;
+    let found;
+    this.workspace.iterateAllLeaves((leaf) => {
+      if (found)
+        return;
+      if (leaf.getRoot() !== root)
+        return;
+      if (leaf.view.getViewType() === VIEW_TYPE_WORKING_TABS)
+        return;
+      found = leaf;
+    });
+    return found;
+  }
   createLeafFor(behavior) {
     var _a, _b;
     switch (behavior.mode) {
       case "split": {
-        const anchor = this.workspace.getMostRecentLeaf();
+        const anchor = this.editorLeaf();
         if (anchor)
           return this.workspace.createLeafBySplit(anchor, (_a = behavior.direction) != null ? _a : "vertical");
         return this.workspace.getLeaf("split", (_b = behavior.direction) != null ? _b : "vertical");
@@ -1260,23 +1321,13 @@ var LeafSync = class {
     this.workspace.setActiveLeaf(leaf, { focus: true });
     await this.workspace.revealLeaf(leaf);
   }
-  /** Activates a group: reveals its pane if still live, otherwise reopens
-   * all its tabs into a fresh pane per `behaviorOverride` or its own
-   * OpenBehavior, remembering the override as its new default.
-   * Mode `'tab'` never merges (D4): reuses an unowned active pane, else splits. */
+  /** Reveals a live group. A dormant group opens only for an explicit placement
+   * (split right, split down, or a new window). Mode `'tab'` does not split. */
   async openGroup(id, behaviorOverride) {
     var _a;
     const group = this.store.find(id);
     if (!group || group.type !== "group")
       return;
-    if (this.isEffectivelyHidden(group)) {
-      if (group.hidden)
-        await this.store.toggleHidden(id);
-      const parent = group.parentId ? this.store.find(group.parentId) : void 0;
-      if ((parent == null ? void 0 : parent.type) === "section" && parent.hidden)
-        await this.store.toggleHidden(parent.id);
-      this.applyHiddenClass(group);
-    }
     const focused = this.store.focusedSectionId;
     if (focused && group.parentId !== focused) {
       await this.store.setFocusedSection(null);
@@ -1293,9 +1344,11 @@ var LeafSync = class {
     if (tabs.length === 0)
       return;
     const behavior = (_a = behaviorOverride != null ? behaviorOverride : group.openBehavior) != null ? _a : this.store.settings.defaultOpenBehavior;
-    if (behaviorOverride)
+    if (behavior.mode === "tab")
+      return;
+    if (behaviorOverride && behaviorOverride.mode !== "tab")
       await this.store.setOpenBehavior(id, behaviorOverride);
-    const first = this.createLeafForOpen(behavior, id);
+    const first = this.createLeafFor(behavior);
     const paneId = getPaneId(first);
     if (paneId)
       await this.store.setHomePane(id, paneId);
@@ -1311,23 +1364,17 @@ var LeafSync = class {
     }
     await this.workspace.revealLeaf(first);
   }
-  /** D4: 'tab' reuses unowned active pane, else vertical split. Never merges. */
-  createLeafForOpen(behavior, openingGroupId) {
-    if (behavior.mode === "tab") {
-      const active = this.workspace.getMostRecentLeaf();
-      const paneId = active ? getPaneId(active) : void 0;
-      if (active && paneId && !this.isPaneOwned(paneId, openingGroupId)) {
-        return this.workspace.createLeafInParent(active.parent, 9999);
-      }
-      if (active)
-        return this.workspace.createLeafBySplit(active, "vertical");
-      return this.workspace.getLeaf("tab");
-    }
-    return this.createLeafFor(behavior);
+  /** Insert this group's tabs into the editor's current tab group. */
+  async moveGroupIntoCurrentTabGroup(sourceId) {
+    const leaf = this.editorLeaf();
+    const paneId = leaf ? getPaneId(leaf) : void 0;
+    if (!paneId)
+      return;
+    await this.mergeGroupInto(sourceId, paneId);
   }
   /**
-   * Explicit merge only (D4): move records into the target group, reopen
-   * leaves in its pane, remove the source, and keep a session receipt for Undo.
+   * Move records into the target group, reopen leaves in its pane, remove the
+   * source, and keep a session receipt for Undo.
    */
   async mergeGroupInto(sourceId, targetPaneId) {
     const group = this.store.find(sourceId);
@@ -1372,7 +1419,7 @@ var LeafSync = class {
   }
   showMergeNotice(fromTitle, toTitle, receipt) {
     const frag = createFragment();
-    frag.appendText(`"${fromTitle}" merged into "${toTitle}". `);
+    frag.appendText(`Moved "${fromTitle}" into "${toTitle}". `);
     const btn = frag.createEl("button", { text: "Undo", cls: "mod-cta" });
     const notice = new import_obsidian.Notice(frag, 0);
     btn.addEventListener("click", () => {
@@ -1424,15 +1471,19 @@ var LeafSync = class {
       this.openingGroups.delete(restored.id);
     }
   }
-  /** Moves a tab's record and its live leaf (if any) into another group. */
+  /** Moves a tab's record and, when the target group is live, its leaf.
+   * An open leaf is not filed onto a dormant group — that split the record from the pane. */
   async moveTab(tab, toGroupId, index) {
     if (tab.type !== "tab")
       return;
-    await this.store.moveInto(tab.id, toGroupId, index);
     const target = this.store.find(toGroupId);
     if (!target || target.type !== "group")
       return;
-    if (!target.homePaneId || !this.findLeafInPane(target.homePaneId))
+    const targetLive = Boolean(target.homePaneId && this.findLeafInPane(target.homePaneId));
+    if (!targetLive && this.findOpenLeaf(tab.tabKey))
+      return;
+    await this.store.moveInto(tab.id, toGroupId, index);
+    if (!targetLive)
       return;
     const updated = this.store.find(tab.id);
     if (!updated)
@@ -1442,18 +1493,18 @@ var LeafSync = class {
     else
       await this.reopenTab(updated);
   }
-  async moveTabToNewGroup(tab) {
+  async moveTabToNewGroup(tab, direction) {
     var _a, _b;
     if (tab.type !== "tab" || !tab.parentId)
       return;
     const source = this.store.find(tab.parentId);
-    const anchor = (_b = (_a = (source == null ? void 0 : source.type) === "group" ? this.findLeafInPane(source.homePaneId) : void 0) != null ? _a : this.findOpenLeaf(tab.tabKey)) != null ? _b : this.workspace.getMostRecentLeaf();
+    const anchor = (_b = (_a = (source == null ? void 0 : source.type) === "group" ? this.findLeafInPane(source.homePaneId) : void 0) != null ? _a : this.findOpenLeaf(tab.tabKey)) != null ? _b : this.editorLeaf();
     if (!anchor)
       return;
     const group = await this.store.addGroup(this.store.nextDefaultTitle("group"), null);
     this.openingGroups.add(group.id);
     try {
-      const first = this.workspace.createLeafBySplit(anchor, "vertical");
+      const first = this.workspace.createLeafBySplit(anchor, direction);
       const paneId = getPaneId(first);
       if (paneId)
         await this.store.setHomePane(group.id, paneId);
@@ -1470,46 +1521,6 @@ var LeafSync = class {
       this.openingGroups.delete(group.id);
     }
   }
-  /**
-   * Opens a group's tabs anchored to a specific drop-target pane.
-   * Centre zone = explicit merge; edges = split.
-   */
-  async openGroupAtDropTarget(id, targetLeaf, zone) {
-    const group = this.store.find(id);
-    if (!group || group.type !== "group")
-      return;
-    const targetPaneId = getPaneId(targetLeaf);
-    if (group.homePaneId && targetPaneId && group.homePaneId === targetPaneId)
-      return;
-    const tabs = this.store.children(id).filter((t) => t.viewState || t.filePath);
-    if (tabs.length === 0)
-      return;
-    if (zone === "center") {
-      if (!targetPaneId)
-        return;
-      await this.mergeGroupInto(id, targetPaneId);
-      return;
-    }
-    this.openingGroups.add(id);
-    try {
-      if (group.homePaneId && this.findLeafInPane(group.homePaneId))
-        await this.closeGroup(id);
-      const direction = zone === "top" || zone === "bottom" ? "horizontal" : "vertical";
-      const before = zone === "top" || zone === "left";
-      const first = this.workspace.createLeafBySplit(targetLeaf, direction, before);
-      const paneId = getPaneId(first);
-      if (paneId)
-        await this.store.setHomePane(id, paneId);
-      await this.openTabInLeaf(first, tabs[0]);
-      for (const tab of tabs.slice(1)) {
-        const leaf = this.workspace.createLeafInParent(first.parent, 9999);
-        await this.openTabInLeaf(leaf, tab);
-      }
-      await this.workspace.revealLeaf(first);
-    } finally {
-      this.openingGroups.delete(id);
-    }
-  }
   /** Closes a group's live pane (all sibling leaves in it), without touching stored data. */
   async closeGroup(id) {
     const group = this.store.find(id);
@@ -1523,34 +1534,45 @@ var LeafSync = class {
     await this.closeGroup(id);
     await this.store.complete(id);
   }
+  /** Bring this section's live tab groups forward. Does not hide anything else. */
+  async revealSection(sectionId) {
+    await this.store.setFocusedSection(sectionId);
+    for (const child of this.store.children(sectionId)) {
+      if (child.type !== "group" || !child.homePaneId)
+        continue;
+      const leaf = this.findLeafInPane(child.homePaneId);
+      if (leaf)
+        await this.workspace.revealLeaf(leaf);
+    }
+  }
+  isStacked(groupId) {
+    var _a;
+    const group = this.store.find(groupId);
+    const leaf = (group == null ? void 0 : group.type) === "group" ? this.findLeafInPane(group.homePaneId) : void 0;
+    return Boolean((_a = leaf == null ? void 0 : leaf.parent) == null ? void 0 : _a.isStacked);
+  }
+  async toggleStacked(groupId) {
+    const group = this.store.find(groupId);
+    if (!group || group.type !== "group")
+      return;
+    const leaf = this.findLeafInPane(group.homePaneId);
+    const parent = leaf == null ? void 0 : leaf.parent;
+    if (!parent || typeof parent.setStacked !== "function")
+      return;
+    parent.setStacked(!parent.isStacked);
+  }
   /** Opens a blank tab in a live group's pane -- the sidebar's stand-in for
    * Obsidian's native "+" button, which lives in the tab-header row the
    * "Hide tab bar" setting hides. Not open yet -- if it's dormant in a
    * section, use "Open" first. */
   async addBlankTab(groupId) {
-    var _a;
     const group = this.store.find(groupId);
     if (!group || group.type !== "group")
       return;
-    let homeLeaf = this.findLeafInPane(group.homePaneId);
-    if (!homeLeaf && this.store.children(groupId).length > 0) {
-      await this.openGroup(groupId);
-      const opened = this.store.find(groupId);
-      homeLeaf = (opened == null ? void 0 : opened.type) === "group" ? this.findLeafInPane(opened.homePaneId) : void 0;
-      if (!homeLeaf)
-        return;
-    }
-    if (homeLeaf) {
-      const leaf2 = this.workspace.createLeafInParent(homeLeaf.parent, 9999);
-      await leaf2.setViewState({ type: "empty", active: true });
-      this.workspace.setActiveLeaf(leaf2, { focus: true });
+    const homeLeaf = this.findLeafInPane(group.homePaneId);
+    if (!homeLeaf)
       return;
-    }
-    const behavior = (_a = group.openBehavior) != null ? _a : this.store.settings.defaultOpenBehavior;
-    const leaf = this.createLeafForOpen(behavior, groupId);
-    const paneId = getPaneId(leaf);
-    if (paneId)
-      await this.store.setHomePane(groupId, paneId);
+    const leaf = this.workspace.createLeafInParent(homeLeaf.parent, 9999);
     await leaf.setViewState({ type: "empty", active: true });
     this.workspace.setActiveLeaf(leaf, { focus: true });
   }
@@ -1730,27 +1752,17 @@ function colorMenuTitle(slot) {
   frag.createSpan({ text: COLOR_LABELS[slot] });
   return frag;
 }
-var PANE_DROP_CLASSES = [
-  "working-tabs-pane-drop-top",
-  "working-tabs-pane-drop-bottom",
-  "working-tabs-pane-drop-left",
-  "working-tabs-pane-drop-right",
-  "working-tabs-pane-drop-center"
-];
-var OPEN_BEHAVIOR_MENU = [
+var PLACEMENT_MENU = [
   { label: "Split right", behavior: { mode: "split", direction: "vertical" } },
   { label: "Split down", behavior: { mode: "split", direction: "horizontal" } },
-  { label: "New window", behavior: { mode: "window" } },
-  { label: "New tab", behavior: { mode: "tab" } }
+  { label: "Open in new window", behavior: { mode: "window" } }
 ];
-var NEW_GROUP_BEHAVIOR_MENU = OPEN_BEHAVIOR_MENU.filter((item) => item.behavior.mode !== "tab");
 var TabSpacesView = class extends import_obsidian4.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
     this.draggedId = null;
     this.dropMarkedEl = null;
-    this.paneDropMarkedEl = null;
     this.unsubscribe = null;
     this.visibleOrder = [];
     this.focusedId = null;
@@ -1789,7 +1801,6 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
     });
     this.treeEl = container.createDiv({ cls: "working-tabs-tree", attr: { tabindex: "0" } });
     this.registerRootDropZone(this.treeEl);
-    this.registerWorkspaceDropZones();
     this.treeEl.addEventListener("keydown", (evt) => this.handleKeydown(evt));
     this.unsubscribe = this.store.onChange(() => {
       if (this.renamingId)
@@ -1939,24 +1950,6 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
       textCol.createDiv({ cls: "working-tabs-description", text: node.description });
     }
     const actions = row.createDiv({ cls: "working-tabs-row-actions" });
-    this.makeGroupActionButton(
-      actions,
-      "crosshair",
-      focused ? "Unfocus section" : "Focus section",
-      (evt) => {
-        evt.stopPropagation();
-        void this.store.setFocusedSection(focused ? null : node.id);
-      }
-    );
-    this.makeGroupActionButton(
-      actions,
-      node.hidden ? "eye-off" : "eye",
-      node.hidden ? "Unhide all groups in this section" : "Hide all groups in this section",
-      (evt) => {
-        evt.stopPropagation();
-        void this.plugin.leafSync.toggleSectionHidden(node.id);
-      }
-    );
     this.makeGroupActionButton(actions, "ellipsis-vertical", "More", (evt) => {
       evt.stopPropagation();
       this.showSectionMenu(node, evt);
@@ -2007,38 +2000,11 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
       textCol.createDiv({ cls: "working-tabs-description", text: node.description });
     }
     const actions = row.createDiv({ cls: "working-tabs-row-actions" });
-    if (!live) {
+    if (!live && !isCompleted) {
       this.makeGroupActionButton(actions, "external-link", "Open", (evt) => {
         evt.stopPropagation();
-        const menu = new import_obsidian4.Menu();
-        for (const { label, behavior } of OPEN_BEHAVIOR_MENU) {
-          menu.addItem(
-            (item) => item.setTitle(label).onClick(() => void this.plugin.leafSync.openGroup(node.id, behavior))
-          );
-        }
-        menu.addSeparator();
-        menu.addItem(
-          (item) => item.setTitle("Open in current pane (merge)").onClick(() => {
-            var _a;
-            const active = this.app.workspace.getMostRecentLeaf();
-            const paneId = active ? (_a = active.parent) == null ? void 0 : _a.id : void 0;
-            if (paneId)
-              void this.plugin.leafSync.mergeGroupInto(node.id, paneId);
-          })
-        );
-        menu.showAtMouseEvent(evt);
+        this.showPlacementMenu(node, evt);
       });
-    }
-    if (live) {
-      this.makeGroupActionButton(
-        actions,
-        node.hidden ? "eye-off" : "eye",
-        node.hidden ? "Unhide pane" : "Hide pane",
-        (evt) => {
-          evt.stopPropagation();
-          void this.plugin.leafSync.toggleGroupHidden(node.id);
-        }
-      );
     }
     this.makeGroupActionButton(
       actions,
@@ -2056,7 +2022,12 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
       evt.stopPropagation();
       this.showGroupMenu(node, evt, isCompleted);
     });
-    this.wireRowClick(row, () => void this.plugin.leafSync.openGroup(node.id));
+    this.wireRowClick(row, () => {
+      if (live)
+        void this.plugin.leafSync.openGroup(node.id);
+      else if (!isCompleted)
+        this.showPlacementMenu(node);
+    });
     row.addEventListener("contextmenu", (evt) => {
       evt.preventDefault();
       this.showGroupMenu(node, evt, isCompleted);
@@ -2108,7 +2079,7 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
     row.createSpan({ cls: "working-tabs-title", text: "New group" });
     row.addEventListener("click", (evt) => {
       const menu = new import_obsidian4.Menu();
-      for (const { label, behavior } of NEW_GROUP_BEHAVIOR_MENU) {
+      for (const { label, behavior } of PLACEMENT_MENU) {
         menu.addItem((item) => item.setTitle(label).onClick(() => void this.plugin.leafSync.openNewGroup(behavior)));
       }
       menu.showAtMouseEvent(evt);
@@ -2281,9 +2252,12 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
         evt.preventDefault();
         if (node.type === "section")
           void this.store.toggleCollapsed(node.id);
-        else if (node.type === "group")
-          void this.plugin.leafSync.openGroup(node.id);
-        else
+        else if (node.type === "group") {
+          if (this.plugin.leafSync.isLive(node.id))
+            void this.plugin.leafSync.openGroup(node.id);
+          else
+            this.showPlacementMenu(node);
+        } else
           void this.plugin.leafSync.focusTab(node);
         break;
       case "F2": {
@@ -2405,21 +2379,35 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
     }
     menu.showAtMouseEvent(evt);
   }
+  /** Placement for a dormant group. Nothing opens until one of these verbs is chosen. */
+  showPlacementMenu(node, evt) {
+    const menu = new import_obsidian4.Menu();
+    for (const { label, behavior } of PLACEMENT_MENU) {
+      menu.addItem(
+        (item) => item.setTitle(label).onClick(() => void this.plugin.leafSync.openGroup(node.id, behavior))
+      );
+    }
+    menu.addItem(
+      (item) => item.setTitle("Move into current tab group").setIcon("layers").onClick(() => void this.plugin.leafSync.moveGroupIntoCurrentTabGroup(node.id))
+    );
+    if (evt)
+      menu.showAtMouseEvent(evt);
+    else {
+      const row = this.treeEl.querySelector(`[data-node-id="${node.id}"]`);
+      const rect = row == null ? void 0 : row.getBoundingClientRect();
+      if (rect)
+        menu.showAtPosition({ x: rect.left, y: rect.bottom });
+    }
+  }
   showSectionMenu(node, evt) {
     const menu = new import_obsidian4.Menu();
     const focused = this.store.focusedSectionId === node.id;
     menu.addItem(
       (item) => item.setTitle(focused ? "Unfocus" : "Focus").setIcon("crosshair").onClick(() => {
-        void this.store.setFocusedSection(focused ? null : node.id);
-      })
-    );
-    menu.addItem(
-      (item) => item.setTitle("Open all").setIcon("folder-open").onClick(() => {
-        for (const child of this.store.children(node.id)) {
-          if (child.type === "group" && !this.plugin.leafSync.isLive(child.id)) {
-            void this.plugin.leafSync.openGroup(child.id);
-          }
-        }
+        if (focused)
+          void this.store.setFocusedSection(null);
+        else
+          void this.plugin.leafSync.revealSection(node.id);
       })
     );
     menu.addItem(
@@ -2477,6 +2465,10 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
         (item) => item.setTitle("New tab").setIcon("plus").onClick(() => void this.plugin.leafSync.addBlankTab(node.id))
       );
       if (this.plugin.leafSync.isLive(node.id)) {
+        const stacked = this.plugin.leafSync.isStacked(node.id);
+        menu.addItem(
+          (item) => item.setTitle(stacked ? "Unstack tabs" : "Stack tabs").setIcon("layers").onClick(() => void this.plugin.leafSync.toggleStacked(node.id))
+        );
         menu.addItem(
           (item) => item.setTitle("Close group").setIcon("x").onClick(() => void this.plugin.leafSync.closeGroup(node.id))
         );
@@ -2528,9 +2520,14 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
     );
     menu.addSeparator();
     menu.addItem(
-      (item) => item.setTitle("Move to new group").setIcon("plus-square").onClick(() => void this.plugin.leafSync.moveTabToNewGroup(node))
+      (item) => item.setTitle("Split right").setIcon("separator-vertical").onClick(() => void this.plugin.leafSync.moveTabToNewGroup(node, "vertical"))
     );
-    for (const group of this.store.items.filter((n) => n.type === "group" && n.id !== node.parentId)) {
+    menu.addItem(
+      (item) => item.setTitle("Split down").setIcon("separator-horizontal").onClick(() => void this.plugin.leafSync.moveTabToNewGroup(node, "horizontal"))
+    );
+    for (const group of this.store.items.filter(
+      (n) => n.type === "group" && n.id !== node.parentId && this.plugin.leafSync.isLive(n.id)
+    )) {
       menu.addItem(
         (item) => item.setTitle(`Move to: ${group.title}`).setIcon("folder").onClick(() => {
           void this.plugin.leafSync.moveTab(node, group.id, this.store.children(group.id).length);
@@ -2670,96 +2667,6 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
       void this.store.moveInto(this.draggedId, null, index);
     });
   }
-  /** Lets any group row (dormant or already live) be dragged out of the
-   * sidebar and dropped directly onto a pane in the main workspace -- drop
-   * near an edge to split that exact pane in that direction, or in the
-   * middle to merge in as new tabs there. For an already-live group this
-   * doubles as "move this pane elsewhere" (see openGroupAtDropTarget).
-   * Registered on the document body via event
-   * delegation so it covers every current and future pane without having
-   * to hook each one's DOM as it opens/splits/closes; the `.mod-root`
-   * scope in the selector below excludes the sidebar docks, same reasoning
-   * reconcile already uses to skip them. Uses registerDomEvent (not a raw
-   * addEventListener) since body outlives the view and needs cleanup on close. */
-  registerWorkspaceDropZones() {
-    const rootEl = document.body;
-    const paneSelector = ".mod-root .workspace-tabs";
-    const resolveZone = (paneEl, evt) => {
-      const rect = paneEl.getBoundingClientRect();
-      const x = (evt.clientX - rect.left) / rect.width;
-      const y = (evt.clientY - rect.top) / rect.height;
-      const edge = 0.25;
-      if (y < edge)
-        return "top";
-      if (y > 1 - edge)
-        return "bottom";
-      if (x < edge)
-        return "left";
-      if (x > 1 - edge)
-        return "right";
-      return "center";
-    };
-    const clearPaneMarker = () => {
-      var _a, _b;
-      (_a = this.paneDropMarkedEl) == null ? void 0 : _a.removeClass(...PANE_DROP_CLASSES);
-      (_b = this.paneDropMarkedEl) == null ? void 0 : _b.removeAttribute("data-working-tabs-merge-target");
-      this.paneDropMarkedEl = null;
-    };
-    const draggedGroup = () => {
-      if (!this.draggedId)
-        return void 0;
-      const dragged = this.store.find(this.draggedId);
-      return (dragged == null ? void 0 : dragged.type) === "group" ? dragged : void 0;
-    };
-    this.registerDomEvent(rootEl, "dragover", (evt) => {
-      var _a;
-      if (!draggedGroup())
-        return;
-      const paneEl = evt.target.closest(paneSelector);
-      if (!paneEl) {
-        clearPaneMarker();
-        return;
-      }
-      evt.preventDefault();
-      const zone = resolveZone(paneEl, evt);
-      if (this.paneDropMarkedEl && this.paneDropMarkedEl !== paneEl)
-        clearPaneMarker();
-      paneEl.removeClass(...PANE_DROP_CLASSES);
-      paneEl.removeAttribute("data-working-tabs-merge-target");
-      paneEl.addClass(`working-tabs-pane-drop-${zone}`);
-      if (zone === "center") {
-        const targetLeaf = this.findLeafForPaneEl(paneEl);
-        const paneId = targetLeaf ? (_a = targetLeaf.parent) == null ? void 0 : _a.id : void 0;
-        const owner = paneId ? this.store.items.find((n) => n.type === "group" && n.homePaneId === paneId) : void 0;
-        if (owner)
-          paneEl.setAttribute("data-working-tabs-merge-target", `Merge into ${owner.title}`);
-      }
-      this.paneDropMarkedEl = paneEl;
-    });
-    this.registerDomEvent(rootEl, "dragleave", (evt) => {
-      if (this.paneDropMarkedEl && !this.paneDropMarkedEl.contains(evt.relatedTarget))
-        clearPaneMarker();
-    });
-    this.registerDomEvent(rootEl, "drop", (evt) => {
-      const dragged = draggedGroup();
-      const paneEl = evt.target.closest(paneSelector);
-      clearPaneMarker();
-      if (!dragged || !paneEl)
-        return;
-      evt.preventDefault();
-      const targetLeaf = this.findLeafForPaneEl(paneEl);
-      if (targetLeaf)
-        void this.plugin.leafSync.openGroupAtDropTarget(dragged.id, targetLeaf, resolveZone(paneEl, evt));
-    });
-  }
-  findLeafForPaneEl(paneEl) {
-    let found;
-    this.app.workspace.iterateAllLeaves((l) => {
-      if (!found && l.view.containerEl.closest(".mod-root .workspace-tabs") === paneEl)
-        found = l;
-    });
-    return found;
-  }
   registerSentinelDropZone(headerEl, sentinelId) {
     headerEl.addEventListener("dragover", (evt) => {
       if (!this.draggedId)
@@ -2898,7 +2805,9 @@ var TabSpacesPlugin = class extends import_obsidian6.Plugin {
    * body class since Obsidian's tab-header row isn't reachable per-pane
    * without hooking every pane's DOM as it opens/splits/closes. */
   applyHideTabHeaders() {
-    document.body.toggleClass("working-tabs-hide-tab-headers", this.store.settings.hideTabHeaders);
+    var _a;
+    const body = (_a = document.body) != null ? _a : activeDocument == null ? void 0 : activeDocument.body;
+    body == null ? void 0 : body.toggleClass("working-tabs-hide-tab-headers", this.store.settings.hideTabHeaders);
   }
   /** Called exactly once, the first time a user turns this plugin on. */
   onUserEnable() {
@@ -2916,6 +2825,8 @@ var TabSpacesPlugin = class extends import_obsidian6.Plugin {
       await workspace.revealLeaf(leaf);
   }
   onunload() {
-    document.body.removeClass("working-tabs-hide-tab-headers");
+    var _a;
+    const body = (_a = document.body) != null ? _a : activeDocument == null ? void 0 : activeDocument.body;
+    body == null ? void 0 : body.removeClass("working-tabs-hide-tab-headers");
   }
 };

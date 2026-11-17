@@ -208,7 +208,7 @@ describe('plan()', () => {
 		expect(ofKind(entries, 'claimPane')).toEqual([{ kind: 'claimPane', groupId: 'g1', paneId: 'p1' }]);
 	});
 
-	it('files new groups under the focused section', () => {
+	it('files a new pane at the root even when a section is focused', () => {
 		const nodes = [section('sec1')];
 		const entries = plan(
 			snap([pane('p1', [{ key: 'a.md' }])]),
@@ -216,8 +216,23 @@ describe('plan()', () => {
 			ctx({ focusedSectionId: 'sec1' })
 		);
 		expect(ofKind(entries, 'newGroup')).toEqual([
-			{ kind: 'newGroup', paneId: 'p1', parentId: 'sec1', title: 'Group 1' },
+			{ kind: 'newGroup', paneId: 'p1', parentId: null, title: 'Group 1' },
 		]);
+	});
+
+	it('moves records when a live pane vanishes and its tabs are all in one other pane', () => {
+		const nodes = [
+			group('H', { homePaneId: 'pGone', title: 'Source' }),
+			group('G', { homePaneId: 'pG', title: 'Target' }),
+			tab('t1', 'H', 'x.md', { order: 0 }),
+			tab('t2', 'H', 'y.md', { order: 1 }),
+			tab('t3', 'G', 'z.md', { order: 0 }),
+		];
+		const entries = plan(snap([pane('pG', [{ key: 'z.md' }, { key: 'x.md' }, { key: 'y.md' }])]), nodes, ctx());
+		expect(ofKind(entries, 'moveTabRecord').map((e) => e.tabId).sort()).toEqual(['t1', 't2']);
+		expect(ofKind(entries, 'addTab').some((e) => e.key === 'x.md' || e.key === 'y.md')).toBe(false);
+		expect(ofKind(entries, 'merged')[0]?.toGroupId).toBe('G');
+		expect(ofKind(entries, 'removeGroup').some((e) => e.groupId === 'H')).toBe(true);
 	});
 
 	it('emits syncViewState only in full mode', () => {
@@ -274,14 +289,12 @@ describe('plan()', () => {
 		expect(ofKind(entries, 'addTab').some((e) => e.key === 'a.md' && e.groupId === 'live')).toBe(true);
 	});
 
-	it('effectivelyHidden truth table', () => {
-		const g = { hidden: false, parentId: 'sec' as string | null };
-		expect(effectivelyHidden(g, undefined, null)).toBe(false);
-		expect(effectivelyHidden({ ...g, hidden: true }, undefined, null)).toBe(true);
-		expect(effectivelyHidden(g, { hidden: true }, null)).toBe(true);
-		expect(effectivelyHidden(g, { hidden: false }, 'sec')).toBe(false);
-		expect(effectivelyHidden(g, { hidden: false }, 'other')).toBe(true);
-		expect(effectivelyHidden({ hidden: false, parentId: null }, undefined, 'sec')).toBe(true);
+	it('effectivelyHidden is only the stored hide flags', () => {
+		const g = { hidden: false };
+		expect(effectivelyHidden(g, undefined)).toBe(false);
+		expect(effectivelyHidden({ hidden: true }, undefined)).toBe(true);
+		expect(effectivelyHidden(g, { hidden: true })).toBe(true);
+		expect(effectivelyHidden(g, { hidden: false })).toBe(false);
 	});
 
 	it('reattaches after pane id changes when contents still match exactly', () => {

@@ -19,10 +19,20 @@ function getLeafId(leaf: WorkspaceLeaf): string | undefined {
 	return (leaf as unknown as { id?: string }).id;
 }
 
-/** Undocumented pane id on WorkspaceTabs (`leaf.parent.id`), same class of
- * reliance as leaf.id. Isolated here so a rename is a one-line fix. */
+/** Session-stable pane ids. `leaf.parent.id` is undocumented and can churn
+ * across splits/drags; pinning the first id we see per parent object keeps
+ * claims stable for the session (restart still reattaches via membership D7). */
+const paneIds = new WeakMap<object, string>();
+let paneIdSeq = 0;
+
 function getPaneId(leaf: WorkspaceLeaf): string | undefined {
-	return (leaf.parent as unknown as { id?: string } | null)?.id;
+	const parent = leaf.parent as unknown as { id?: string } | null;
+	if (!parent) return undefined;
+	const cached = paneIds.get(parent);
+	if (cached) return cached;
+	const id = parent.id ?? `pane:${++paneIdSeq}`;
+	paneIds.set(parent, id);
+	return id;
 }
 
 /** Derived from the path alone (not leaf.view.getDisplayText()) so it works
@@ -380,10 +390,6 @@ export class LeafSync {
 		);
 	}
 
-	private isPaneOwned(paneId: string | undefined, excludeId?: string): boolean {
-		return Boolean(this.findOwningGroupByPane(paneId, excludeId));
-	}
-
 	/**
 	 * Ported from Vertical Tabs' own (proven, shipped-for-years) approach:
 	 * toggle a class on the specific pane, then let a *declarative* CSS
@@ -395,17 +401,18 @@ export class LeafSync {
 	 * own, with nothing but a class toggle from us, can't drift out of sync
 	 * with the DOM the way hand-rolled JS state can.
 	 */
-	/** Hidden by own flag, section hide, or being outside the focused section (D12). */
+	/** Stored hide flags. Not applied to the workspace — hiding a pane is Close. */
 	isEffectivelyHidden(group: SpaceNode): boolean {
 		const parent = group.parentId ? this.store.find(group.parentId) : undefined;
 		const section = parent?.type === 'section' ? parent : undefined;
-		return effectivelyHidden(group, section, this.store.focusedSectionId);
+		return effectivelyHidden(group, section);
 	}
 
+	/** Drop a leftover hide class from older builds. The stylesheet no longer hides panes. */
 	private applyHiddenClass(group: SpaceNode): void {
 		const leaf = this.findLeafInPane(group.homePaneId);
 		const tabsEl = leaf?.view.containerEl.closest('.workspace-tabs') as HTMLElement | null;
-		tabsEl?.toggleClass('working-tabs-hidden-pane', this.isEffectivelyHidden(group));
+		tabsEl?.removeClass('working-tabs-hidden-pane');
 	}
 
 	/**
@@ -482,10 +489,25 @@ export class LeafSync {
 	 * is just `createLeafBySplit(getMostRecentLeaf(), d)` under the hood), but
 	 * going through it directly is one less layer to trust, and matches the
 	 * mechanism the workspace drag-and-drop feature already uses successfully. */
+	/** Most recent leaf in the main editor, never a side dock or this sidebar. */
+	private editorLeaf(): WorkspaceLeaf | undefined {
+		const root = this.workspace.rootSplit;
+		const recent = this.workspace.getMostRecentLeaf();
+		if (recent && recent.getRoot() === root && recent.view.getViewType() !== VIEW_TYPE_WORKING_TABS) return recent;
+		let found: WorkspaceLeaf | undefined;
+		this.workspace.iterateAllLeaves((leaf) => {
+			if (found) return;
+			if (leaf.getRoot() !== root) return;
+			if (leaf.view.getViewType() === VIEW_TYPE_WORKING_TABS) return;
+			found = leaf;
+		});
+		return found;
+	}
+
 	private createLeafFor(behavior: OpenBehavior): WorkspaceLeaf {
 		switch (behavior.mode) {
 			case 'split': {
-				const anchor = this.workspace.getMostRecentLeaf();
+				const anchor = this.editorLeaf();
 				if (anchor) return this.workspace.createLeafBySplit(anchor, behavior.direction ?? 'vertical');
 				return this.workspace.getLeaf('split', behavior.direction ?? 'vertical');
 			}
@@ -554,20 +576,11 @@ export class LeafSync {
 		await this.workspace.revealLeaf(leaf);
 	}
 
-	/** Activates a group: reveals its pane if still live, otherwise reopens
-	 * all its tabs into a fresh pane per `behaviorOverride` or its own
-	 * OpenBehavior, remembering the override as its new default.
-	 * Mode `'tab'` never merges (D4): reuses an unowned active pane, else splits. */
+	/** Reveals a live group. A dormant group opens only for an explicit placement
+	 * (split right, split down, or a new window). Mode `'tab'` does not split. */
 	async openGroup(id: string, behaviorOverride?: OpenBehavior): Promise<void> {
 		const group = this.store.find(id);
 		if (!group || group.type !== 'group') return;
-
-		if (this.isEffectivelyHidden(group)) {
-			if (group.hidden) await this.store.toggleHidden(id);
-			const parent = group.parentId ? this.store.find(group.parentId) : undefined;
-			if (parent?.type === 'section' && parent.hidden) await this.store.toggleHidden(parent.id);
-			this.applyHiddenClass(group);
-		}
 
 		const focused = this.store.focusedSectionId;
 		if (focused && group.parentId !== focused) {
@@ -587,9 +600,10 @@ export class LeafSync {
 		if (tabs.length === 0) return;
 
 		const behavior = behaviorOverride ?? group.openBehavior ?? this.store.settings.defaultOpenBehavior;
-		if (behaviorOverride) await this.store.setOpenBehavior(id, behaviorOverride);
+		if (behavior.mode === 'tab') return;
+		if (behaviorOverride && behaviorOverride.mode !== 'tab') await this.store.setOpenBehavior(id, behaviorOverride);
 
-		const first = this.createLeafForOpen(behavior, id);
+		const first = this.createLeafFor(behavior);
 
 		const paneId = getPaneId(first);
 		if (paneId) await this.store.setHomePane(id, paneId);
@@ -608,23 +622,17 @@ export class LeafSync {
 		await this.workspace.revealLeaf(first);
 	}
 
-	/** D4: 'tab' reuses unowned active pane, else vertical split. Never merges. */
-	private createLeafForOpen(behavior: OpenBehavior, openingGroupId: string): WorkspaceLeaf {
-		if (behavior.mode === 'tab') {
-			const active = this.workspace.getMostRecentLeaf();
-			const paneId = active ? getPaneId(active) : undefined;
-			if (active && paneId && !this.isPaneOwned(paneId, openingGroupId)) {
-				return this.workspace.createLeafInParent(active.parent, 9999);
-			}
-			if (active) return this.workspace.createLeafBySplit(active, 'vertical');
-			return this.workspace.getLeaf('tab');
-		}
-		return this.createLeafFor(behavior);
+	/** Insert this group's tabs into the editor's current tab group. */
+	async moveGroupIntoCurrentTabGroup(sourceId: string): Promise<void> {
+		const leaf = this.editorLeaf();
+		const paneId = leaf ? getPaneId(leaf) : undefined;
+		if (!paneId) return;
+		await this.mergeGroupInto(sourceId, paneId);
 	}
 
 	/**
-	 * Explicit merge only (D4): move records into the target group, reopen
-	 * leaves in its pane, remove the source, and keep a session receipt for Undo.
+	 * Move records into the target group, reopen leaves in its pane, remove the
+	 * source, and keep a session receipt for Undo.
 	 */
 	async mergeGroupInto(sourceId: string, targetPaneId: string): Promise<void> {
 		const group = this.store.find(sourceId);
@@ -670,7 +678,7 @@ export class LeafSync {
 		receipt: { group: SpaceNode; tabIds: string[]; targetGroupId: string; at: number }
 	): void {
 		const frag = createFragment();
-		frag.appendText(`"${fromTitle}" merged into "${toTitle}". `);
+		frag.appendText(`Moved "${fromTitle}" into "${toTitle}". `);
 		const btn = frag.createEl('button', { text: 'Undo', cls: 'mod-cta' });
 		const notice = new Notice(frag, 0);
 		btn.addEventListener('click', () => {
@@ -736,32 +744,35 @@ export class LeafSync {
 		}
 	}
 
-	/** Moves a tab's record and its live leaf (if any) into another group. */
+	/** Moves a tab's record and, when the target group is live, its leaf.
+	 * An open leaf is not filed onto a dormant group — that split the record from the pane. */
 	async moveTab(tab: SpaceNode, toGroupId: string, index: number): Promise<void> {
 		if (tab.type !== 'tab') return;
-		await this.store.moveInto(tab.id, toGroupId, index);
 		const target = this.store.find(toGroupId);
 		if (!target || target.type !== 'group') return;
-		if (!target.homePaneId || !this.findLeafInPane(target.homePaneId)) return;
+		const targetLive = Boolean(target.homePaneId && this.findLeafInPane(target.homePaneId));
+		if (!targetLive && this.findOpenLeaf(tab.tabKey)) return;
+		await this.store.moveInto(tab.id, toGroupId, index);
+		if (!targetLive) return;
 		const updated = this.store.find(tab.id);
 		if (!updated) return;
 		if (this.findOpenLeaf(updated.tabKey)) await this.relocateLiveLeaf(updated);
 		else await this.reopenTab(updated);
 	}
 
-	async moveTabToNewGroup(tab: SpaceNode): Promise<void> {
+	async moveTabToNewGroup(tab: SpaceNode, direction: 'vertical' | 'horizontal'): Promise<void> {
 		if (tab.type !== 'tab' || !tab.parentId) return;
 		const source = this.store.find(tab.parentId);
 		const anchor =
 			(source?.type === 'group' ? this.findLeafInPane(source.homePaneId) : undefined) ??
 			this.findOpenLeaf(tab.tabKey) ??
-			this.workspace.getMostRecentLeaf();
+			this.editorLeaf();
 		if (!anchor) return;
 
 		const group = await this.store.addGroup(this.store.nextDefaultTitle('group'), null);
 		this.openingGroups.add(group.id);
 		try {
-			const first = this.workspace.createLeafBySplit(anchor, 'vertical');
+			const first = this.workspace.createLeafBySplit(anchor, direction);
 			const paneId = getPaneId(first);
 			if (paneId) await this.store.setHomePane(group.id, paneId);
 			await this.store.moveInto(tab.id, group.id, 0);
@@ -774,52 +785,6 @@ export class LeafSync {
 			await this.workspace.revealLeaf(first);
 		} finally {
 			this.openingGroups.delete(group.id);
-		}
-	}
-
-	/**
-	 * Opens a group's tabs anchored to a specific drop-target pane.
-	 * Centre zone = explicit merge; edges = split.
-	 */
-	async openGroupAtDropTarget(
-		id: string,
-		targetLeaf: WorkspaceLeaf,
-		zone: 'top' | 'bottom' | 'left' | 'right' | 'center'
-	): Promise<void> {
-		const group = this.store.find(id);
-		if (!group || group.type !== 'group') return;
-
-		const targetPaneId = getPaneId(targetLeaf);
-		if (group.homePaneId && targetPaneId && group.homePaneId === targetPaneId) return;
-
-		const tabs = this.store.children(id).filter((t) => t.viewState || t.filePath);
-		if (tabs.length === 0) return;
-
-		if (zone === 'center') {
-			if (!targetPaneId) return;
-			await this.mergeGroupInto(id, targetPaneId);
-			return;
-		}
-
-		this.openingGroups.add(id);
-		try {
-			if (group.homePaneId && this.findLeafInPane(group.homePaneId)) await this.closeGroup(id);
-
-			const direction = zone === 'top' || zone === 'bottom' ? 'horizontal' : 'vertical';
-			const before = zone === 'top' || zone === 'left';
-			const first = this.workspace.createLeafBySplit(targetLeaf, direction, before);
-
-			const paneId = getPaneId(first);
-			if (paneId) await this.store.setHomePane(id, paneId);
-
-			await this.openTabInLeaf(first, tabs[0]);
-			for (const tab of tabs.slice(1)) {
-				const leaf = this.workspace.createLeafInParent(first.parent, 9999);
-				await this.openTabInLeaf(leaf, tab);
-			}
-			await this.workspace.revealLeaf(first);
-		} finally {
-			this.openingGroups.delete(id);
 		}
 	}
 
@@ -836,6 +801,31 @@ export class LeafSync {
 		await this.store.complete(id);
 	}
 
+	/** Bring this section's live tab groups forward. Does not hide anything else. */
+	async revealSection(sectionId: string): Promise<void> {
+		await this.store.setFocusedSection(sectionId);
+		for (const child of this.store.children(sectionId)) {
+			if (child.type !== 'group' || !child.homePaneId) continue;
+			const leaf = this.findLeafInPane(child.homePaneId);
+			if (leaf) await this.workspace.revealLeaf(leaf);
+		}
+	}
+
+	isStacked(groupId: string): boolean {
+		const group = this.store.find(groupId);
+		const leaf = group?.type === 'group' ? this.findLeafInPane(group.homePaneId) : undefined;
+		return Boolean((leaf?.parent as { isStacked?: boolean } | undefined)?.isStacked);
+	}
+
+	async toggleStacked(groupId: string): Promise<void> {
+		const group = this.store.find(groupId);
+		if (!group || group.type !== 'group') return;
+		const leaf = this.findLeafInPane(group.homePaneId);
+		const parent = leaf?.parent as { isStacked?: boolean; setStacked?: (stacked: boolean) => void } | undefined;
+		if (!parent || typeof parent.setStacked !== 'function') return;
+		parent.setStacked(!parent.isStacked);
+	}
+
 	/** Opens a blank tab in a live group's pane -- the sidebar's stand-in for
 	 * Obsidian's native "+" button, which lives in the tab-header row the
 	 * "Hide tab bar" setting hides. Not open yet -- if it's dormant in a
@@ -843,27 +833,9 @@ export class LeafSync {
 	async addBlankTab(groupId: string): Promise<void> {
 		const group = this.store.find(groupId);
 		if (!group || group.type !== 'group') return;
-
-		let homeLeaf = this.findLeafInPane(group.homePaneId);
-
-		if (!homeLeaf && this.store.children(groupId).length > 0) {
-			await this.openGroup(groupId);
-			const opened = this.store.find(groupId);
-			homeLeaf = opened?.type === 'group' ? this.findLeafInPane(opened.homePaneId) : undefined;
-			if (!homeLeaf) return;
-		}
-
-		if (homeLeaf) {
-			const leaf = this.workspace.createLeafInParent(homeLeaf.parent, 9999);
-			await leaf.setViewState({ type: 'empty', active: true });
-			this.workspace.setActiveLeaf(leaf, { focus: true });
-			return;
-		}
-
-		const behavior = group.openBehavior ?? this.store.settings.defaultOpenBehavior;
-		const leaf = this.createLeafForOpen(behavior, groupId);
-		const paneId = getPaneId(leaf);
-		if (paneId) await this.store.setHomePane(groupId, paneId);
+		const homeLeaf = this.findLeafInPane(group.homePaneId);
+		if (!homeLeaf) return;
+		const leaf = this.workspace.createLeafInParent(homeLeaf.parent, 9999);
 		await leaf.setViewState({ type: 'empty', active: true });
 		this.workspace.setActiveLeaf(leaf, { focus: true });
 	}

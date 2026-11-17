@@ -48,7 +48,10 @@ export default class TabSpacesPlugin extends Plugin {
 	 * body class since Obsidian's tab-header row isn't reachable per-pane
 	 * without hooking every pane's DOM as it opens/splits/closes. */
 	private applyHideTabHeaders(): void {
-		document.body.toggleClass('working-tabs-hide-tab-headers', this.store.settings.hideTabHeaders);
+		// Pop-out windows / early layout can leave `document.body` unset; never
+		// throw from a store listener (reconcile notifies on the same path).
+		const body = document.body ?? activeDocument?.body;
+		body?.toggleClass('working-tabs-hide-tab-headers', this.store.settings.hideTabHeaders);
 	}
 
 	/** Called exactly once, the first time a user turns this plugin on. */
@@ -68,6 +71,7 @@ export default class TabSpacesPlugin extends Plugin {
 
 	onunload(): void {
 		// View instances clean up their own store subscription in onClose().
-		document.body.removeClass('working-tabs-hide-tab-headers');
+		const body = document.body ?? activeDocument?.body;
+		body?.removeClass('working-tabs-hide-tab-headers');
 	}
 }

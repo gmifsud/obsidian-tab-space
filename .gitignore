@@ -4,3 +4,12 @@ node_modules/
 dist/
 data.json
 *.js.map
+# agentforge generated
+.codex/skills
+.agents/skills
+.gemini/skills
+.codex/.agentforge-skills.json
+.agents/.agentforge-skills.json
+.gemini/.agentforge-skills.json
+.cursor/skills
+.cursor/.agentforge-skills.json

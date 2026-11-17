@@ -57,15 +57,13 @@ export function isBlankTab(tab: SpaceNode): boolean {
 	return !type || type === 'empty';
 }
 
-/** Pure D12 hide rule — group flag, section flag, or outside focused section. */
+/** Stored hide flags only. Focus does not hide panes — that pulled flex items out of Obsidian's split tree. */
 export function effectivelyHidden(
-	group: Pick<SpaceNode, 'hidden' | 'parentId'>,
-	section: Pick<SpaceNode, 'hidden'> | undefined,
-	focusedSectionId: string | null
+	group: Pick<SpaceNode, 'hidden'>,
+	section: Pick<SpaceNode, 'hidden'> | undefined
 ): boolean {
 	if (group.hidden) return true;
 	if (section?.hidden) return true;
-	if (focusedSectionId && group.parentId !== focusedSectionId) return true;
 	return false;
 }
 
@@ -167,6 +165,41 @@ export function plan(
 			claimByPane.set(pane.paneId, g.id);
 			break;
 		}
+	}
+
+	// A live group whose pane is gone, and whose non-done tabs all sit in one
+	// remaining claimed pane, moves those records instead of copying them.
+	// The snapshot has no empty pane, so the later merge step never sees this.
+	for (const g of groups) {
+		if (claimByGroup.has(g.id) || !g.homePaneId) continue;
+		const nonDone = childrenOf(nodes, g.id).filter((t) => !t.done && t.tabKey);
+		if (nonDone.length === 0) continue;
+		const hosts = snapshot.panes.filter((pane) => {
+			const keys = new Set(pane.leaves.map((l) => l.identity.key));
+			return nonDone.every((t) => keys.has(t.tabKey as string));
+		});
+		if (hosts.length !== 1) continue;
+		const hostId = claimByPane.get(hosts[0].paneId);
+		if (!hostId || hostId === g.id) continue;
+		const tabIds: string[] = [];
+		for (const tab of nonDone) {
+			entries.push({
+				kind: 'moveTabRecord',
+				tabId: tab.id,
+				fromGroupId: g.id,
+				toGroupId: hostId,
+			});
+			movedTabIds.add(tab.id);
+			effectiveParent.set(tab.id, hostId);
+			tabIds.push(tab.id);
+		}
+		entries.push({
+			kind: 'merged',
+			fromGroup: { ...g },
+			toGroupId: hostId,
+			tabIds,
+		});
+		entries.push({ kind: 'removeGroup', groupId: g.id });
 	}
 
 	// 4. Mirror (D1) — moves/adds for every claimed pane first, then prunes/order.
@@ -299,7 +332,7 @@ export function plan(
 		entries.push({
 			kind: 'newGroup',
 			paneId: pane.paneId,
-			parentId: ctx.focusedSectionId,
+			parentId: null,
 			title: ctx.nextDefaultTitle(),
 		});
 		const gid = pendingGroupId(pane.paneId);
