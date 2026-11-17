@@ -364,6 +364,34 @@ export class LeafSync {
 		}
 	}
 
+	/** The tab-group element this stored group claims, if that pane still exists. */
+	paneElement(groupId: string): HTMLElement | null {
+		const group = this.store.find(groupId);
+		if (!group || group.type !== 'group') return null;
+		const leaf = this.findLeafInPane(group.homePaneId);
+		return (leaf?.view.containerEl.closest('.workspace-tabs') as HTMLElement | null) ?? null;
+	}
+
+	/** True when that pane is in the layout and has a visible box. */
+	isRendered(groupId: string): boolean {
+		const el = this.paneElement(groupId);
+		if (!el) return false;
+		const style = getComputedStyle(el);
+		if (style.display === 'none' || style.visibility === 'hidden') return false;
+		const rect = el.getBoundingClientRect();
+		return rect.width >= 2 && rect.height >= 2;
+	}
+
+	/** Outline the selected group's pane. Clears any previous outline. */
+	markSelectedPane(groupId: string | null): void {
+		const marked = document.querySelectorAll('.workspace-tabs.working-tabs-selected-pane');
+		for (let i = 0; i < marked.length; i++) {
+			(marked[i] as HTMLElement).removeClass('working-tabs-selected-pane');
+		}
+		if (!groupId || !this.isRendered(groupId)) return;
+		this.paneElement(groupId)?.addClass('working-tabs-selected-pane');
+	}
+
 	/** First leaf whose parent pane id matches, if any. */
 	private findLeafInPane(paneId: string | undefined): WorkspaceLeaf | undefined {
 		if (!paneId) return undefined;
@@ -566,14 +594,31 @@ export class LeafSync {
 	async focusTab(tab: SpaceNode): Promise<void> {
 		if (tab.type !== 'tab' || !tab.parentId) return;
 		let leaf = this.findOpenLeaf(tab.tabKey);
-		if (!leaf) {
-			await this.openGroup(tab.parentId);
+		if (!leaf && this.isLive(tab.parentId)) {
+			await this.reopenTab(tab);
 			leaf = this.findOpenLeaf(tab.tabKey);
 		}
 		if (!leaf) return;
 		await leaf.loadIfDeferred();
 		this.workspace.setActiveLeaf(leaf, { focus: true });
 		await this.workspace.revealLeaf(leaf);
+	}
+
+	/** Put this group's tabs into the editor's current tab group. A live group is only revealed. */
+	async openInCurrentGroup(id: string): Promise<void> {
+		if (this.isLive(id)) {
+			await this.openGroup(id);
+			return;
+		}
+		await this.moveGroupIntoCurrentTabGroup(id);
+	}
+
+	/** Open this group's tabs in a new pane to the right. Closes the old pane first when it is already live. */
+	async openInNewGroup(id: string): Promise<void> {
+		const group = this.store.find(id);
+		if (!group || group.type !== 'group') return;
+		if (group.homePaneId && this.findLeafInPane(group.homePaneId)) await this.closeGroup(id);
+		await this.openGroup(id, { mode: 'split', direction: 'vertical' });
 	}
 
 	/** Reveals a live group. A dormant group opens only for an explicit placement

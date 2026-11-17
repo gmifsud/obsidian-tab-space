@@ -192,6 +192,7 @@ export class TabSpacesView extends ItemView {
 			(v) => (this.completedCollapsed = v),
 			query
 		);
+		if (this.focusedId) this.showWhetherOnScreen(this.focusedId);
 	}
 
 	private renderNode(parentEl: HTMLElement, node: SpaceNode, depth: number, isCompleted: boolean, query: string): void {
@@ -304,17 +305,12 @@ export class TabSpacesView extends ItemView {
 		this.wireRename(title, node);
 		const tabCount = this.store.children(node.id).length;
 		titleRow.createSpan({ cls: 'working-tabs-count', text: String(tabCount) });
+		titleRow.createSpan({ cls: 'working-tabs-screen-state' });
 		if (node.description) {
 			textCol.createDiv({ cls: 'working-tabs-description', text: node.description });
 		}
 
 		const actions = row.createDiv({ cls: 'working-tabs-row-actions' });
-		if (!live && !isCompleted) {
-			this.makeGroupActionButton(actions, 'external-link', 'Open', (evt) => {
-				evt.stopPropagation();
-				this.showPlacementMenu(node, evt);
-			});
-		}
 		this.makeGroupActionButton(
 			actions,
 			isCompleted ? 'rotate-ccw' : 'check-circle',
@@ -330,10 +326,7 @@ export class TabSpacesView extends ItemView {
 			this.showGroupMenu(node, evt, isCompleted);
 		});
 
-		this.wireRowClick(row, () => {
-			if (live) void this.plugin.leafSync.openGroup(node.id);
-			else if (!isCompleted) this.showPlacementMenu(node);
-		});
+		this.wireRowClick(row, () => void this.store.toggleCollapsed(node.id));
 		row.addEventListener('contextmenu', (evt) => {
 			evt.preventDefault();
 			this.showGroupMenu(node, evt, isCompleted);
@@ -533,6 +526,31 @@ export class TabSpacesView extends ItemView {
 		el?.addClass('is-focused');
 		el?.scrollIntoView({ block: 'nearest' });
 		if (takeKeyboardFocus) this.treeEl.focus();
+		this.showWhetherOnScreen(id);
+	}
+
+	/** On the selected group, say if its pane is actually visible, and outline that pane. */
+	private showWhetherOnScreen(id: string | null): void {
+		const labels = this.treeEl.querySelectorAll('.working-tabs-screen-state');
+		for (let i = 0; i < labels.length; i++) {
+			const label = labels[i] as HTMLElement;
+			label.setText('');
+			label.removeAttribute('data-state');
+		}
+		const node = id ? this.store.find(id) : undefined;
+		if (!node || node.type !== 'group') {
+			this.plugin.leafSync.markSelectedPane(null);
+			return;
+		}
+		const onScreen = this.plugin.leafSync.isRendered(node.id);
+		const label = this.treeEl.querySelector<HTMLElement>(
+			`[data-node-id="${node.id}"] .working-tabs-screen-state`
+		);
+		if (label) {
+			label.setText(onScreen ? 'on screen' : 'not on screen');
+			label.setAttribute('data-state', onScreen ? 'on' : 'off');
+		}
+		this.plugin.leafSync.markSelectedPane(onScreen ? node.id : null);
 	}
 
 	private moveFocus(delta: number): void {
@@ -582,10 +600,7 @@ export class TabSpacesView extends ItemView {
 			case 'Enter':
 				evt.preventDefault();
 				if (node.type === 'section') void this.store.toggleCollapsed(node.id);
-				else if (node.type === 'group') {
-					if (this.plugin.leafSync.isLive(node.id)) void this.plugin.leafSync.openGroup(node.id);
-					else this.showPlacementMenu(node);
-				}
+				else if (node.type === 'group') void this.store.toggleCollapsed(node.id);
 				else void this.plugin.leafSync.focusTab(node);
 				break;
 			case 'F2': {
@@ -748,28 +763,6 @@ export class TabSpacesView extends ItemView {
 		menu.showAtMouseEvent(evt);
 	}
 
-	/** Placement for a dormant group. Nothing opens until one of these verbs is chosen. */
-	private showPlacementMenu(node: SpaceNode, evt?: MouseEvent): void {
-		const menu = new Menu();
-		for (const { label, behavior } of PLACEMENT_MENU) {
-			menu.addItem((item) =>
-				item.setTitle(label).onClick(() => void this.plugin.leafSync.openGroup(node.id, behavior))
-			);
-		}
-		menu.addItem((item) =>
-			item
-				.setTitle('Move into current tab group')
-				.setIcon('layers')
-				.onClick(() => void this.plugin.leafSync.moveGroupIntoCurrentTabGroup(node.id))
-		);
-		if (evt) menu.showAtMouseEvent(evt);
-		else {
-			const row = this.treeEl.querySelector<HTMLElement>(`[data-node-id="${node.id}"]`);
-			const rect = row?.getBoundingClientRect();
-			if (rect) menu.showAtPosition({ x: rect.left, y: rect.bottom });
-		}
-	}
-
 	private showSectionMenu(node: SpaceNode, evt: MouseEvent): void {
 		const menu = new Menu();
 		const focused = this.store.focusedSectionId === node.id;
@@ -831,6 +824,19 @@ export class TabSpacesView extends ItemView {
 	private showGroupMenu(node: SpaceNode, evt: MouseEvent, isCompleted: boolean): void {
 		const menu = new Menu();
 		if (!isCompleted) {
+			menu.addItem((item) =>
+				item
+					.setTitle('Open in group')
+					.setIcon('folder-open')
+					.onClick(() => void this.plugin.leafSync.openInCurrentGroup(node.id))
+			);
+			menu.addItem((item) =>
+				item
+					.setTitle('Open in new group')
+					.setIcon('plus-square')
+					.onClick(() => void this.plugin.leafSync.openInNewGroup(node.id))
+			);
+			menu.addSeparator();
 			menu.addItem((item) =>
 				item.setTitle('New tab').setIcon('plus').onClick(() => void this.plugin.leafSync.addBlankTab(node.id))
 			);

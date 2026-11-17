@@ -1106,6 +1106,37 @@ var LeafSync = class {
       }
     }
   }
+  /** The tab-group element this stored group claims, if that pane still exists. */
+  paneElement(groupId) {
+    var _a;
+    const group = this.store.find(groupId);
+    if (!group || group.type !== "group")
+      return null;
+    const leaf = this.findLeafInPane(group.homePaneId);
+    return (_a = leaf == null ? void 0 : leaf.view.containerEl.closest(".workspace-tabs")) != null ? _a : null;
+  }
+  /** True when that pane is in the layout and has a visible box. */
+  isRendered(groupId) {
+    const el = this.paneElement(groupId);
+    if (!el)
+      return false;
+    const style = getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden")
+      return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width >= 2 && rect.height >= 2;
+  }
+  /** Outline the selected group's pane. Clears any previous outline. */
+  markSelectedPane(groupId) {
+    var _a;
+    const marked = document.querySelectorAll(".workspace-tabs.working-tabs-selected-pane");
+    for (let i = 0; i < marked.length; i++) {
+      marked[i].removeClass("working-tabs-selected-pane");
+    }
+    if (!groupId || !this.isRendered(groupId))
+      return;
+    (_a = this.paneElement(groupId)) == null ? void 0 : _a.addClass("working-tabs-selected-pane");
+  }
   /** First leaf whose parent pane id matches, if any. */
   findLeafInPane(paneId) {
     if (!paneId)
@@ -1311,8 +1342,8 @@ var LeafSync = class {
     if (tab.type !== "tab" || !tab.parentId)
       return;
     let leaf = this.findOpenLeaf(tab.tabKey);
-    if (!leaf) {
-      await this.openGroup(tab.parentId);
+    if (!leaf && this.isLive(tab.parentId)) {
+      await this.reopenTab(tab);
       leaf = this.findOpenLeaf(tab.tabKey);
     }
     if (!leaf)
@@ -1320,6 +1351,23 @@ var LeafSync = class {
     await leaf.loadIfDeferred();
     this.workspace.setActiveLeaf(leaf, { focus: true });
     await this.workspace.revealLeaf(leaf);
+  }
+  /** Put this group's tabs into the editor's current tab group. A live group is only revealed. */
+  async openInCurrentGroup(id) {
+    if (this.isLive(id)) {
+      await this.openGroup(id);
+      return;
+    }
+    await this.moveGroupIntoCurrentTabGroup(id);
+  }
+  /** Open this group's tabs in a new pane to the right. Closes the old pane first when it is already live. */
+  async openInNewGroup(id) {
+    const group = this.store.find(id);
+    if (!group || group.type !== "group")
+      return;
+    if (group.homePaneId && this.findLeafInPane(group.homePaneId))
+      await this.closeGroup(id);
+    await this.openGroup(id, { mode: "split", direction: "vertical" });
   }
   /** Reveals a live group. A dormant group opens only for an explicit placement
    * (split right, split down, or a new window). Mode `'tab'` does not split. */
@@ -1897,6 +1945,8 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
       (v) => this.completedCollapsed = v,
       query
     );
+    if (this.focusedId)
+      this.showWhetherOnScreen(this.focusedId);
   }
   renderNode(parentEl, node, depth, isCompleted, query) {
     if (node.type === "section")
@@ -1996,16 +2046,11 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
     this.wireRename(title, node);
     const tabCount = this.store.children(node.id).length;
     titleRow.createSpan({ cls: "working-tabs-count", text: String(tabCount) });
+    titleRow.createSpan({ cls: "working-tabs-screen-state" });
     if (node.description) {
       textCol.createDiv({ cls: "working-tabs-description", text: node.description });
     }
     const actions = row.createDiv({ cls: "working-tabs-row-actions" });
-    if (!live && !isCompleted) {
-      this.makeGroupActionButton(actions, "external-link", "Open", (evt) => {
-        evt.stopPropagation();
-        this.showPlacementMenu(node, evt);
-      });
-    }
     this.makeGroupActionButton(
       actions,
       isCompleted ? "rotate-ccw" : "check-circle",
@@ -2022,12 +2067,7 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
       evt.stopPropagation();
       this.showGroupMenu(node, evt, isCompleted);
     });
-    this.wireRowClick(row, () => {
-      if (live)
-        void this.plugin.leafSync.openGroup(node.id);
-      else if (!isCompleted)
-        this.showPlacementMenu(node);
-    });
+    this.wireRowClick(row, () => void this.store.toggleCollapsed(node.id));
     row.addEventListener("contextmenu", (evt) => {
       evt.preventDefault();
       this.showGroupMenu(node, evt, isCompleted);
@@ -2202,6 +2242,30 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
     el == null ? void 0 : el.scrollIntoView({ block: "nearest" });
     if (takeKeyboardFocus)
       this.treeEl.focus();
+    this.showWhetherOnScreen(id);
+  }
+  /** On the selected group, say if its pane is actually visible, and outline that pane. */
+  showWhetherOnScreen(id) {
+    const labels = this.treeEl.querySelectorAll(".working-tabs-screen-state");
+    for (let i = 0; i < labels.length; i++) {
+      const label2 = labels[i];
+      label2.setText("");
+      label2.removeAttribute("data-state");
+    }
+    const node = id ? this.store.find(id) : void 0;
+    if (!node || node.type !== "group") {
+      this.plugin.leafSync.markSelectedPane(null);
+      return;
+    }
+    const onScreen = this.plugin.leafSync.isRendered(node.id);
+    const label = this.treeEl.querySelector(
+      `[data-node-id="${node.id}"] .working-tabs-screen-state`
+    );
+    if (label) {
+      label.setText(onScreen ? "on screen" : "not on screen");
+      label.setAttribute("data-state", onScreen ? "on" : "off");
+    }
+    this.plugin.leafSync.markSelectedPane(onScreen ? node.id : null);
   }
   moveFocus(delta) {
     if (this.visibleOrder.length === 0)
@@ -2252,12 +2316,9 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
         evt.preventDefault();
         if (node.type === "section")
           void this.store.toggleCollapsed(node.id);
-        else if (node.type === "group") {
-          if (this.plugin.leafSync.isLive(node.id))
-            void this.plugin.leafSync.openGroup(node.id);
-          else
-            this.showPlacementMenu(node);
-        } else
+        else if (node.type === "group")
+          void this.store.toggleCollapsed(node.id);
+        else
           void this.plugin.leafSync.focusTab(node);
         break;
       case "F2": {
@@ -2379,26 +2440,6 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
     }
     menu.showAtMouseEvent(evt);
   }
-  /** Placement for a dormant group. Nothing opens until one of these verbs is chosen. */
-  showPlacementMenu(node, evt) {
-    const menu = new import_obsidian4.Menu();
-    for (const { label, behavior } of PLACEMENT_MENU) {
-      menu.addItem(
-        (item) => item.setTitle(label).onClick(() => void this.plugin.leafSync.openGroup(node.id, behavior))
-      );
-    }
-    menu.addItem(
-      (item) => item.setTitle("Move into current tab group").setIcon("layers").onClick(() => void this.plugin.leafSync.moveGroupIntoCurrentTabGroup(node.id))
-    );
-    if (evt)
-      menu.showAtMouseEvent(evt);
-    else {
-      const row = this.treeEl.querySelector(`[data-node-id="${node.id}"]`);
-      const rect = row == null ? void 0 : row.getBoundingClientRect();
-      if (rect)
-        menu.showAtPosition({ x: rect.left, y: rect.bottom });
-    }
-  }
   showSectionMenu(node, evt) {
     const menu = new import_obsidian4.Menu();
     const focused = this.store.focusedSectionId === node.id;
@@ -2461,6 +2502,13 @@ var TabSpacesView = class extends import_obsidian4.ItemView {
   showGroupMenu(node, evt, isCompleted) {
     const menu = new import_obsidian4.Menu();
     if (!isCompleted) {
+      menu.addItem(
+        (item) => item.setTitle("Open in group").setIcon("folder-open").onClick(() => void this.plugin.leafSync.openInCurrentGroup(node.id))
+      );
+      menu.addItem(
+        (item) => item.setTitle("Open in new group").setIcon("plus-square").onClick(() => void this.plugin.leafSync.openInNewGroup(node.id))
+      );
+      menu.addSeparator();
       menu.addItem(
         (item) => item.setTitle("New tab").setIcon("plus").onClick(() => void this.plugin.leafSync.addBlankTab(node.id))
       );

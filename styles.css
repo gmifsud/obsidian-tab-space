@@ -246,6 +246,32 @@ body {
 	color: var(--interactive-accent, #7c6ff0);
 }
 
+.working-tabs-screen-state:empty {
+	display: none;
+}
+
+.working-tabs-screen-state {
+	flex: 0 0 auto;
+	font-size: 10px;
+	letter-spacing: 0.02em;
+	text-transform: lowercase;
+}
+
+.working-tabs-screen-state[data-state='on'] {
+	color: var(--text-accent);
+}
+
+.working-tabs-screen-state[data-state='off'] {
+	color: var(--text-faint);
+}
+
+/* Marks the pane that belongs to the group selected in the sidebar.
+   Outline only — it must not change the split's flex sizes. */
+.workspace-tabs.working-tabs-selected-pane {
+	outline: 2px solid var(--interactive-accent, #7c6ff0);
+	outline-offset: -2px;
+}
+
 /* Marked "tucked away" -- sidebar-only, doesn't touch the real pane. */
 .working-tabs-group-header.is-hidden-pane {
 	opacity: 0.55;
