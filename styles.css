@@ -59,6 +59,7 @@ body {
 
 .working-tabs-tree {
 	flex: 1 1 auto;
+	min-height: 0;
 	overflow-y: auto;
 	padding: 4px 6px 6px;
 	display: flex;
@@ -174,13 +175,38 @@ body {
 	font-weight: 600;
 }
 
-/* Real (user-created) sections get a divider above them so they read as a
-   distinct break in the list, not just another group -- the synthetic
-   Completed bucket is excluded since it already has its own divider. */
-.working-tabs-section:not(.working-tabs-synthetic-section) {
-	border-top: 1px solid var(--background-modifier-border);
-	padding-top: 4px;
-	margin-top: 4px;
+/* A section is a folder of sessions, not another coloured group. Its chrome
+   stays on Obsidian's own surfaces so it never shares a slot with a group. */
+.working-tabs-cluster.is-sections .working-tabs-section:not(.working-tabs-synthetic-section) {
+	background-color: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	padding: 4px;
+	margin-top: 8px;
+}
+
+.working-tabs-cluster.is-sections .working-tabs-colored::before {
+	content: none;
+}
+
+.working-tabs-cluster.is-sections .working-tabs-group-header,
+.working-tabs-cluster.is-sections .working-tabs-group-header.working-tabs-colored {
+	background-color: var(--background-secondary);
+}
+
+.working-tabs-cluster.is-sections .working-tabs-group-header:hover,
+.working-tabs-cluster.is-sections .working-tabs-group-header.working-tabs-colored:hover,
+.working-tabs-cluster.is-sections .working-tabs-section-header:hover {
+	background-color: var(--background-modifier-hover);
+}
+
+.working-tabs-cluster.is-sections .working-tabs-tab-row.working-tabs-colored,
+.working-tabs-cluster.is-sections .working-tabs-tab-row.working-tabs-colored:hover {
+	background-color: transparent;
+}
+
+.working-tabs-cluster.is-sections .working-tabs-section-header {
+	background-color: transparent;
 }
 
 .working-tabs-text-col {
@@ -241,9 +267,36 @@ body {
 	color: var(--interactive-accent, #7c6ff0);
 }
 
-/* A group's pane is currently open. */
-.working-tabs-group-header.is-live .working-tabs-title {
-	color: var(--interactive-accent, #7c6ff0);
+/* A live group keeps a normal title. The chip and the fill say it is open;
+   recolouring the words made them hard to read on the tint. */
+.working-tabs-live-chip {
+	flex: 0 0 auto;
+	font-size: 10px;
+	line-height: 16px;
+	padding: 0 6px;
+	border-radius: 10px;
+	color: var(--text-normal);
+	background-color: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+}
+
+/* Neutral bar for every group. Colour fill is only for a group whose pane
+   is on screen, so a long hibernating list stays a list of names. The stripe
+   on the left still carries that group's colour. */
+.working-tabs-group-header {
+	background-color: var(--background-modifier-active, var(--background-modifier-hover));
+}
+
+.working-tabs-cluster.is-onscreen .working-tabs-group-header.working-tabs-colored {
+	background-color: color-mix(in srgb, var(--working-tabs-accent) 36%, transparent);
+}
+
+.working-tabs-group-header:hover {
+	background-color: var(--background-modifier-hover);
+}
+
+.working-tabs-cluster.is-onscreen .working-tabs-group-header.working-tabs-colored:hover {
+	background-color: color-mix(in srgb, var(--working-tabs-accent) 48%, transparent);
 }
 
 .working-tabs-screen-state:empty {
@@ -342,6 +395,52 @@ body {
 	flex: 0 0 auto;
 }
 
+.working-tabs-cluster {
+	margin: 4px 6px 0;
+	padding: 2px 2px 8px;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.working-tabs-cluster.is-onscreen {
+	background-color: var(--background-modifier-hover);
+	border-radius: 8px;
+	border-bottom-color: transparent;
+	margin-bottom: 8px;
+}
+
+.working-tabs-cluster.is-hibernating {
+	margin-top: 10px;
+}
+
+.working-tabs-cluster.is-sections {
+	margin-top: 10px;
+	border-bottom: none;
+}
+
+.working-tabs-cluster-label {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 8px 8px 4px;
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+}
+
+.working-tabs-cluster-label .working-tabs-count {
+	margin-left: auto;
+	color: var(--text-faint);
+	letter-spacing: 0;
+	font-weight: 500;
+}
+
+.working-tabs-title-row .working-tabs-count {
+	color: var(--text-normal);
+	background-color: var(--background-primary);
+}
+
 /* The "+ New group" / "+ Create a section" pair, sitting between the groups
    block and the sections block. */
 .working-tabs-new-group-row .working-tabs-title,
@@ -355,19 +454,10 @@ body {
 	color: var(--text-normal);
 }
 
-/* Same divider treatment real sections get, since this row heads their
-   block -- and the first section then drops its own so the two lines don't
-   stack up with a single row between them. */
 .working-tabs-create-section-row {
 	border-top: 1px solid var(--background-modifier-border);
 	padding-top: 8px;
 	margin-top: 4px;
-}
-
-.working-tabs-create-section-row + .working-tabs-section:not(.working-tabs-synthetic-section) {
-	border-top: none;
-	padding-top: 0;
-	margin-top: 0;
 }
 
 .working-tabs-done-toggle {
@@ -397,33 +487,105 @@ body {
  * JS state (snapshotted flex values, etc.) that can drift out of sync with
  * reality -- the failure mode that caused that corruption.
  */
-/* Colour coding, workspace side: a stripe down the pane's leading edge, set by
-   LeafSync.applyAccent. Deliberately not on the tab-header row -- the "Hide tab
-   bar" setting below removes that element entirely, so an accent living there
-   would disappear for exactly the people relying on the sidebar most.
-
-   An overlay rather than a border (which would shift the pane's layout) or an
-   inset box-shadow (which the pane's own children paint straight over, since
-   .view-content carries an opaque --background-primary across the full width).
-   `position: relative` is asserted here rather than assumed: it costs nothing
-   if Obsidian already sets it, and the stripe silently escapes to some ancestor
-   if it doesn't. pointer-events: none keeps it clear of the pane drop zones,
-   which are live along exactly this edge (see registerWorkspaceDropZones). */
+/* Group colour is a light tint on the tab face. The selected tab is that
+   same tint plus one hairline border. The multi-row tab snippet paints every
+   active tab solid orange with !important, so these rules have to match that
+   weight, and only on panes this plugin has coloured. */
 .workspace-tabs.working-tabs-accented {
-	position: relative;
+	box-shadow: inset 3px 0 0 var(--working-tabs-accent);
+	--tab-outline-width: 0px;
+	--tab-outline-color: transparent;
 }
 
-.workspace-tabs.working-tabs-accented::before {
-	content: '';
-	position: absolute;
-	left: 0;
-	top: 0;
-	bottom: 0;
-	width: 3px;
-	z-index: 1;
-	pointer-events: none;
-	border-radius: 3px 0 0 3px;
-	background-color: var(--working-tabs-accent);
+.workspace-split.mod-root .workspace-tabs.working-tabs-accented .workspace-tab-header,
+.workspace-split.mod-root .workspace-tabs.working-tabs-accented .workspace-tab-header.is-active,
+.workspace-split.mod-root .workspace-tabs.working-tabs-accented .workspace-tab-header.is-active::before,
+.workspace-split.mod-root .workspace-tabs.working-tabs-accented .workspace-tab-header.is-active::after {
+	background: transparent !important;
+	background-color: transparent !important;
+	background-image: none !important;
+	box-shadow: none !important;
+	outline: none !important;
+	border: none !important;
+	border-bottom: none !important;
+	font-weight: 400 !important;
+	color: var(--text-normal) !important;
+}
+
+.workspace-split.mod-root .workspace-tabs.working-tabs-accented .workspace-tab-header .workspace-tab-header-inner {
+	background-color: color-mix(in srgb, var(--working-tabs-accent) 22%, var(--background-primary)) !important;
+	background-image: none !important;
+	border: 1px solid transparent !important;
+	border-radius: var(--tab-radius, var(--radius-s, 6px));
+	box-shadow: none !important;
+	outline: none !important;
+	color: var(--text-normal) !important;
+	font-weight: 400 !important;
+}
+
+.workspace-split.mod-root .workspace-tabs.working-tabs-accented .workspace-tab-header.is-active .workspace-tab-header-inner {
+	border-color: var(--tab-background-selected, var(--interactive-accent, #b35209)) !important;
+}
+
+.workspace-split.mod-root .workspace-tabs.working-tabs-accented .workspace-tab-header-inner-title,
+.workspace-split.mod-root .workspace-tabs.working-tabs-accented .workspace-tab-header-inner-icon {
+	color: var(--text-normal) !important;
+	font-weight: 400 !important;
+}
+
+.modal.mod-working-tabs-editor {
+	width: 92vw !important;
+	max-width: 92vw !important;
+	height: 86vh !important;
+	max-height: 86vh !important;
+	display: flex;
+	flex-direction: column;
+	padding: 12px;
+	background-color: var(--background-primary);
+}
+
+.modal.mod-working-tabs-editor .modal-content.working-tabs-editor-modal {
+	flex: 1 1 auto;
+	min-height: 0;
+	height: 100%;
+	max-height: none;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	margin: 0;
+	padding: 0;
+	background-color: var(--background-primary);
+}
+
+.modal.mod-working-tabs-editor .working-tabs-editor-host {
+	display: flex;
+	flex: 1 1 auto;
+	min-height: 0;
+	width: 100%;
+	height: 100%;
+	background-color: var(--background-primary);
+}
+
+.modal.mod-working-tabs-editor .working-tabs-editor-leaf,
+.modal.mod-working-tabs-editor .working-tabs-editor-leaf .workspace-leaf-content,
+.modal.mod-working-tabs-editor .working-tabs-editor-leaf .view-content,
+.modal.mod-working-tabs-editor .working-tabs-editor-leaf .markdown-source-view,
+.modal.mod-working-tabs-editor .working-tabs-editor-leaf .cm-editor,
+.modal.mod-working-tabs-editor .working-tabs-editor-leaf .cm-scroller {
+	width: 100%;
+	height: 100%;
+	min-height: 0;
+	max-width: none;
+	flex: 1 1 auto;
+	background-color: var(--background-primary);
+}
+
+.working-tabs-tab-row.working-tabs-colored {
+	background-color: color-mix(in srgb, var(--working-tabs-accent) 16%, transparent);
+}
+
+.working-tabs-tab-row.working-tabs-colored:hover {
+	background-color: color-mix(in srgb, var(--working-tabs-accent) 28%, var(--background-modifier-hover));
 }
 
 /* The colour circle beside each name in the colour menu -- see colorMenuTitle
@@ -470,6 +632,60 @@ body {
 	background-color: var(--background-modifier-border);
 	outline: 1px solid var(--interactive-accent, #7c6ff0);
 	outline-offset: -1px;
+}
+
+.working-tabs-pool {
+	margin: 2px 8px 6px;
+	border: 1px dashed var(--background-modifier-border);
+	background-color: transparent;
+}
+
+.working-tabs-pool.is-drop {
+	border-color: var(--interactive-accent);
+	background-color: var(--background-modifier-hover);
+}
+
+.working-tabs-pool-label {
+	padding: 4px 8px 0;
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+}
+
+.working-tabs-pool-empty {
+	padding: 2px 8px 6px;
+	color: var(--text-faint);
+}
+
+.working-tabs-origin {
+	margin-left: 8px;
+	color: var(--text-faint);
+	font-size: var(--font-ui-smaller);
+}
+
+.working-tabs-row.is-picked {
+	box-shadow: inset 2px 0 0 var(--interactive-accent);
+}
+
+.workspace-leaf.working-tabs-viewport-drop.is-center {
+	box-shadow: inset 0 0 0 2px var(--interactive-accent);
+}
+
+.workspace-leaf.working-tabs-viewport-drop.is-left {
+	box-shadow: inset 8px 0 0 var(--interactive-accent);
+}
+
+.workspace-leaf.working-tabs-viewport-drop.is-right {
+	box-shadow: inset -8px 0 0 var(--interactive-accent);
+}
+
+.workspace-leaf.working-tabs-viewport-drop.is-top {
+	box-shadow: inset 0 8px 0 var(--interactive-accent);
+}
+
+.workspace-leaf.working-tabs-viewport-drop.is-bottom {
+	box-shadow: inset 0 -8px 0 var(--interactive-accent);
 }
 
 /* "Hide tab bar" setting -- scoped to `.mod-root` (Obsidian's own class for

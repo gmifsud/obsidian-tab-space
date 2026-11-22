@@ -87,34 +87,45 @@ function ofKind<K extends PlanEntry['kind']>(entries: PlanEntry[], kind: K): Ext
 }
 
 describe('plan()', () => {
-	it('reattaches a dormant group when every non-done tab is in an unclaimed pane', () => {
-		const nodes = [
-			group('g1'),
-			tab('t1', 'g1', 'a.md', { order: 0 }),
-			tab('t2', 'g1', 'b.md', { order: 1 }),
-		];
-		const entries = plan(snap([pane('p1', [{ key: 'a.md' }, { key: 'b.md' }])]), nodes, ctx());
-		expect(ofKind(entries, 'claimPane')).toEqual([{ kind: 'claimPane', groupId: 'g1', paneId: 'p1' }]);
-		expect(ofKind(entries, 'newGroup')).toHaveLength(0);
-	});
-
-	it('leaves dormant intact and creates a new group on partial reattach', () => {
+	it('reattaches a dormant group when the open pane is part of its tab list', () => {
 		const nodes = [
 			group('g1'),
 			tab('t1', 'g1', 'a.md', { order: 0 }),
 			tab('t2', 'g1', 'b.md', { order: 1 }),
 		];
 		const entries = plan(snap([pane('p1', [{ key: 'a.md' }])]), nodes, ctx());
+		expect(ofKind(entries, 'claimPane')).toEqual([{ kind: 'claimPane', groupId: 'g1', paneId: 'p1' }]);
+		expect(ofKind(entries, 'newGroup')).toHaveLength(0);
+		expect(ofKind(entries, 'pruneTab')).toHaveLength(0);
+	});
+
+	it('leaves dormant intact and creates a new group when the pane has a foreign file', () => {
+		const nodes = [
+			group('g1'),
+			tab('t1', 'g1', 'a.md', { order: 0 }),
+			tab('t2', 'g1', 'b.md', { order: 1 }),
+		];
+		const entries = plan(snap([pane('p1', [{ key: 'a.md' }, { key: 'c.md' }])]), nodes, ctx());
 		expect(ofKind(entries, 'claimPane').filter((e) => e.groupId === 'g1')).toHaveLength(0);
 		expect(ofKind(entries, 'newGroup')).toEqual([
 			{ kind: 'newGroup', paneId: 'p1', parentId: null, title: 'Group 1' },
 		]);
-		expect(ofKind(entries, 'addTab').some((e) => e.groupId === pendingGroupId('p1') && e.key === 'a.md')).toBe(
-			true
-		);
-		// Dormant list never mutated
-		expect(ofKind(entries, 'moveTabRecord')).toHaveLength(0);
 		expect(ofKind(entries, 'pruneTab').filter((e) => e.tabId === 't1' || e.tabId === 't2')).toHaveLength(0);
+	});
+
+	it('gives a pane back from an automatic Group N to the named group', () => {
+		const nodes = [
+			group('auto', { title: 'Group 13', homePaneId: 'p1' }),
+			tab('live', 'auto', 'a.md'),
+			group('named', { title: 'External Services' }),
+			tab('kept', 'named', 'a.md'),
+			tab('also', 'named', 'b.md'),
+		];
+		const entries = plan(snap([pane('p1', [{ key: 'a.md' }])]), nodes, ctx());
+		expect(ofKind(entries, 'releasePane').some((entry) => entry.groupId === 'auto')).toBe(true);
+		expect(ofKind(entries, 'claimPane')).toContainEqual({ kind: 'claimPane', groupId: 'named', paneId: 'p1' });
+		expect(ofKind(entries, 'newGroup')).toHaveLength(0);
+		expect(ofKind(entries, 'pruneTab').some((entry) => entry.tabId === 'also')).toBe(false);
 	});
 
 	it('moves a tab record between live groups without destroy/recreate; done sibling not pruned', () => {
@@ -247,7 +258,10 @@ describe('plan()', () => {
 
 		const poll = plan(snapshot, nodes, ctx({ mode: 'poll' }));
 		expect(ofKind(poll, 'syncViewState')).toHaveLength(0);
-		expect(ofKind(poll, 'syncTitle')).toHaveLength(1);
+		expect(ofKind(poll, 'syncTitle')).toHaveLength(0);
+
+		const renamed = plan(snap([pane('p1', [{ key: 'a.md', title: 'Renamed' }])]), nodes, ctx());
+		expect(ofKind(renamed, 'syncTitle')).toEqual([{ kind: 'syncTitle', tabId: 't1', title: 'Renamed' }]);
 	});
 
 	it('never prune+adds the same key in one plan when moving between live groups', () => {
@@ -287,6 +301,65 @@ describe('plan()', () => {
 		expect(ofKind(entries, 'moveTabRecord')).toHaveLength(0);
 		expect(ofKind(entries, 'pruneTab').some((e) => e.tabId === 't1')).toBe(false);
 		expect(ofKind(entries, 'addTab').some((e) => e.key === 'a.md' && e.groupId === 'live')).toBe(true);
+	});
+
+	it('leaves a pooled tab in its section while its leaf stays open', () => {
+		const nodes = [
+			section('work'),
+			group('g1', { homePaneId: 'p1' }),
+			tab('pooled', 'work', 'a.md', { order: 0 }),
+			tab('live', 'g1', 'b.md', { order: 0 }),
+		];
+		const entries = plan(snap([pane('p1', [{ key: 'a.md' }, { key: 'b.md' }])]), nodes, ctx());
+		expect(ofKind(entries, 'addTab').some((entry) => entry.key === 'a.md')).toBe(false);
+		expect(ofKind(entries, 'moveTabRecord').some((entry) => entry.tabId === 'pooled')).toBe(false);
+		expect(ofKind(entries, 'pruneTab').some((entry) => entry.tabId === 'pooled')).toBe(false);
+	});
+
+	it('does not invent a group for a pane whose leaves are all pooled', () => {
+		const nodes = [
+			section('work'),
+			group('g1'),
+			tab('pooled', 'work', 'a.md', { order: 0 }),
+		];
+		const entries = plan(snap([pane('p1', [{ key: 'a.md' }])]), nodes, ctx());
+		expect(ofKind(entries, 'newGroup')).toHaveLength(0);
+		expect(ofKind(entries, 'addTab')).toHaveLength(0);
+	});
+
+	it('drops a second copy of the same tab inside one group', () => {
+		const nodes = [
+			group('g1', { homePaneId: 'p1' }),
+			tab('t1', 'g1', 'a.md', { order: 0 }),
+			tab('t2', 'g1', 'a.md', { order: 1 }),
+		];
+		const entries = plan(snap([pane('p1', [{ key: 'a.md' }])]), nodes, ctx());
+		expect(ofKind(entries, 'pruneTab').map((entry) => entry.tabId)).toEqual(['t1']);
+		expect(ofKind(entries, 'addTab')).toHaveLength(0);
+	});
+
+	it('keeps a stored tab that is not open in the live pane', () => {
+		const nodes = [
+			group('footer', { homePaneId: 'p1' }),
+			tab('open1', 'footer', 'a.md', { order: 0 }),
+			tab('open2', 'footer', 'b.md', { order: 1 }),
+			tab('kept', 'footer', 'c.md', { order: 2 }),
+		];
+		const entries = plan(snap([pane('p1', [{ key: 'a.md' }, { key: 'b.md' }])]), nodes, ctx());
+		expect(ofKind(entries, 'pruneTab').some((entry) => entry.tabId === 'kept')).toBe(false);
+	});
+
+	it('does not add another copy when the live group already has the tab', () => {
+		const nodes = [
+			group('live', { homePaneId: 'p1' }),
+			tab('already', 'live', 'a.md', { order: 0 }),
+			group('dormant'),
+			tab('old', 'dormant', 'a.md', { order: 0 }),
+		];
+		const entries = plan(snap([pane('p1', [{ key: 'a.md' }])]), nodes, ctx());
+		expect(ofKind(entries, 'addTab').some((entry) => entry.groupId === 'live' && entry.key === 'a.md')).toBe(
+			false
+		);
 	});
 
 	it('effectivelyHidden is only the stored hide flags', () => {

@@ -11,6 +11,8 @@ import {
 	type TabIdentity,
 	type WorkspaceSnapshot,
 } from './membership';
+import { installPaneMenus } from './pane-menus';
+import { needsViewStateForIdentity } from './tab-identity';
 
 /** Every leaf has a runtime `id` (that's what getLeafById() looks up), but it
  * isn't part of the public WorkspaceLeaf type -- this is the standard
@@ -24,6 +26,22 @@ function getLeafId(leaf: WorkspaceLeaf): string | undefined {
  * claims stable for the session (restart still reattaches via membership D7). */
 const paneIds = new WeakMap<object, string>();
 let paneIdSeq = 0;
+
+export type DockEdge = 'left' | 'right' | 'top' | 'bottom';
+type SplitDirectionName = 'vertical' | 'horizontal';
+
+/** The bits of a workspace split or tab group this plugin moves. */
+interface SplitNode {
+	parent: SplitNode | null;
+	children: SplitNode[];
+	direction?: 'vertical' | 'horizontal' | null;
+	removeChild(child: SplitNode): void;
+	insertChild(index: number, child: SplitNode): void;
+}
+
+function splitNode(value: unknown): SplitNode {
+	return value as SplitNode;
+}
 
 function getPaneId(leaf: WorkspaceLeaf): string | undefined {
 	const parent = leaf.parent as unknown as { id?: string } | null;
@@ -127,6 +145,15 @@ export class LeafSync {
 	 * key too, which would otherwise get misread as a real path.
 	 */
 	private getTabIdentity(leaf: WorkspaceLeaf): TabIdentity {
+		const direct = this.directFilePath(leaf);
+		if (direct) return { key: direct, path: direct, title: titleFromPath(direct) };
+
+		const type = leaf.view.getViewType();
+		if (!needsViewStateForIdentity(type, direct)) {
+			const leafId = getLeafId(leaf) ?? `${Date.now()}-${Math.random()}`;
+			return { key: `${type}:${leafId}`, title: leaf.getDisplayText() || type || 'Untitled' };
+		}
+
 		const viewState = this.readViewState(leaf);
 		const rawFile = viewState.state?.file;
 		const path =
@@ -135,21 +162,45 @@ export class LeafSync {
 				: undefined;
 		if (path) return { key: path, path, title: titleFromPath(path) };
 
-		// No file -- fall back to a session-scoped identity. This can't survive
-		// a restart (leaf ids reset), which just reflects that most non-file
-		// views (a terminal process, an in-memory web viewer tab) generally
-		// can't be restored across a restart either.
 		const leafId = getLeafId(leaf) ?? `${Date.now()}-${Math.random()}`;
 		const title = leaf.getDisplayText() || viewState.type || 'Untitled';
-		return { key: `${viewState.type}:${leafId}`, title };
+		return { key: `${type}:${leafId}`, title };
+	}
+
+	/** A loaded file view exposes its path. A deferred view does not. */
+	private directFilePath(leaf: WorkspaceLeaf): string | undefined {
+		const file = (leaf.view as { file?: { path?: string } }).file;
+		if (typeof file?.path !== 'string' || !file.path) return undefined;
+		return this.app.vault.getAbstractFileByPath(file.path) instanceof TFile ? file.path : undefined;
 	}
 
 	/** The reverse of clicking a tab in the sidebar: given a leaf that just
 	 * became active in the workspace, finds the stored tab tracking it (if
-	 * any), so the sidebar can highlight/reveal it in turn. */
+	 * any), so the sidebar can highlight/reveal it in turn.
+	 * The same file can sit in several groups, so the match is the record
+	 * under the group that claims this leaf's pane. */
 	findTabForLeaf(leaf: WorkspaceLeaf): SpaceNode | undefined {
-		const key = this.getTabIdentity(leaf).key;
-		return this.store.items.find((i) => i.type === 'tab' && i.tabKey === key);
+		// The open view already knows its file. getViewState() here serialises
+		// the whole view (a terminal dumps its scrollback) and forces layout.
+		const key = this.openLeafKey(leaf);
+		const paneId = getPaneId(leaf);
+		const owner = paneId
+			? this.store.items.find((item) => item.type === 'group' && item.homePaneId === paneId)
+			: undefined;
+		if (owner) {
+			const inGroup = this.store.children(owner.id).find((item) => item.type === 'tab' && item.tabKey === key);
+			if (inGroup) return inGroup;
+		}
+		return this.store.items.find((item) => item.type === 'tab' && item.tabKey === key);
+	}
+
+	/** Identity of a leaf that is already on screen, without reading view state. */
+	private openLeafKey(leaf: WorkspaceLeaf): string {
+		const file = (leaf.view as { file?: { path?: string } }).file;
+		if (typeof file?.path === 'string' && file.path) return file.path;
+		const id = getLeafId(leaf);
+		const type = leaf.view.getViewType();
+		return id ? `${type}:${id}` : this.getTabIdentity(leaf).key;
 	}
 
 	private reconcileRunning = false;
@@ -191,7 +242,12 @@ export class LeafSync {
 
 	start(): void {
 		this.workspace.onLayoutReady(() => void this.reconcile());
-		this.plugin.registerEvent(this.workspace.on('layout-change', () => void this.reconcile()));
+		// Membership has to follow splits and tab moves, but reading every leaf's
+		// view state here made each of those events serialise terminal scrollback.
+		// Titles and membership use the cheap identity. View state waits for the
+		// poll interval inside doReconcile.
+		this.plugin.registerEvent(this.workspace.on('layout-change', () => void this.reconcile('poll')));
+		installPaneMenus(this.plugin);
 
 		// A rename made through another plugin's own UI (e.g. Terminus letting
 		// you rename a terminal tab) only touches that plugin's internal DOM
@@ -276,11 +332,13 @@ export class LeafSync {
 		});
 		await this.applyPlan(entries);
 
+		const leafByPane = this.firstLeafByPane();
 		for (const node of this.store.items) {
-			if (node.type === 'group' && node.homePaneId && this.findLeafInPane(node.homePaneId)) {
-				this.applyHiddenClass(node);
-				this.applyAccent(node);
-			}
+			if (node.type !== 'group' || !node.homePaneId) continue;
+			const leaf = leafByPane.get(node.homePaneId);
+			if (!leaf) continue;
+			this.applyHiddenClass(node, leaf);
+			this.applyAccent(node, leaf);
 		}
 	}
 
@@ -436,9 +494,17 @@ export class LeafSync {
 		return effectivelyHidden(group, section);
 	}
 
+	private firstLeafByPane(): Map<string, WorkspaceLeaf> {
+		const leafByPane = new Map<string, WorkspaceLeaf>();
+		this.workspace.iterateAllLeaves((leaf) => {
+			const paneId = getPaneId(leaf);
+			if (paneId && !leafByPane.has(paneId)) leafByPane.set(paneId, leaf);
+		});
+		return leafByPane;
+	}
+
 	/** Drop a leftover hide class from older builds. The stylesheet no longer hides panes. */
-	private applyHiddenClass(group: SpaceNode): void {
-		const leaf = this.findLeafInPane(group.homePaneId);
+	private applyHiddenClass(group: SpaceNode, leaf = this.findLeafInPane(group.homePaneId)): void {
 		const tabsEl = leaf?.view.containerEl.closest('.workspace-tabs') as HTMLElement | null;
 		tabsEl?.removeClass('working-tabs-hidden-pane');
 	}
@@ -459,17 +525,15 @@ export class LeafSync {
 	 * as they open and close, and a stripe left behind would claim a pane still
 	 * belongs to a group that has since moved out of it.
 	 */
-	private applyAccent(group: SpaceNode): void {
-		const leaf = this.findLeafInPane(group.homePaneId);
+	private applyAccent(group: SpaceNode, leaf = this.findLeafInPane(group.homePaneId)): void {
 		const tabsEl = leaf?.view.containerEl.closest('.workspace-tabs') as HTMLElement | null;
 		if (!tabsEl) return;
-		const slot = this.store.effectiveColor(group);
-		const next = slot ? `var(--working-tabs-color-${slot})` : '';
+		const next = this.store.accentCss(group) ?? '';
 		// Compared before writing because refreshAccents runs on every store
 		// change (which includes each reconcile tick), and the overwhelmingly
 		// common case is that nothing about the colour has moved.
 		if (tabsEl.style.getPropertyValue('--working-tabs-accent') === next) return;
-		if (slot) {
+		if (next) {
 			tabsEl.style.setProperty('--working-tabs-accent', next);
 			tabsEl.addClass('working-tabs-accented');
 		} else {
@@ -532,6 +596,237 @@ export class LeafSync {
 		return found;
 	}
 
+	/**
+	 * Move this group's own leaves into a pane on one edge. A pane already on
+	 * that edge is split so the new group sits beside it. Leaves open in some
+	 * other group's pane stay where they are.
+	 */
+	private async dockLeaves(leaves: WorkspaceLeaf[], edge: DockEdge, closed: SpaceNode[] = []): Promise<SplitNode | null> {
+		const editor = this.editorLeaf();
+		const neighbor = this.findEdgeAnchor(edge, leaves);
+		const beside = Boolean(neighbor);
+		const orientation: SplitDirectionName = beside
+			? edge === 'top' || edge === 'bottom'
+				? 'vertical'
+				: 'horizontal'
+			: edge === 'left' || edge === 'right'
+				? 'vertical'
+				: 'horizontal';
+		const before = !beside && (edge === 'left' || edge === 'top');
+		const basis = neighbor ?? (editor && !leaves.includes(editor) ? editor : leaves[0] ?? editor);
+		if (!basis && closed.length === 0) return null;
+		const anchor = basis ?? this.workspace.getLeaf('tab');
+		const placeholder = this.workspace.createLeafBySplit(anchor, orientation, before);
+		const tabs = splitNode(placeholder.parent);
+		for (const leaf of leaves) {
+			if (leaf !== placeholder && leaf.parent !== placeholder.parent) this.reparentLeaf(leaf, tabs);
+		}
+		for (const tab of closed) {
+			const leaf = this.workspace.createLeafInParent(placeholder.parent, 9999);
+			await this.openTabInLeaf(leaf, tab);
+		}
+		if (leaves.length > 0 || closed.length > 0) placeholder.detach();
+		if (!beside) this.hoistToEdge(tabs, edge);
+		else this.markDock(tabs, edge);
+		(this.workspace as unknown as { requestResize?: () => void }).requestResize?.();
+		const focus = leaves[0];
+		if (focus && focus.parent) this.workspace.setActiveLeaf(focus, { focus: true });
+		return tabs;
+	}
+
+	/** A pane already sitting on this edge, excluding the leaves being moved. */
+	private findEdgeAnchor(edge: DockEdge, moving: WorkspaceLeaf[]): WorkspaceLeaf | undefined {
+		const movingSet = new Set(moving);
+		const view = this.workspace.containerEl.getBoundingClientRect();
+		let best: { leaf: WorkspaceLeaf; score: number } | undefined;
+		this.workspace.iterateAllLeaves((leaf) => {
+			if (movingSet.has(leaf) || leaf.getRoot() !== this.workspace.rootSplit) return;
+			if (leaf.view.getViewType() === VIEW_TYPE_WORKING_TABS) return;
+			const el = leaf.view.containerEl.closest('.workspace-tabs');
+			if (!el) return;
+			const rect = el.getBoundingClientRect();
+			const marked = el.hasClass(`working-tabs-dock-${edge}`);
+			const thin =
+				edge === 'bottom' || edge === 'top'
+					? rect.height > 0 && rect.height < view.height * 0.92
+					: rect.width > 0 && rect.width < view.width * 0.92;
+			const onEdge =
+				edge === 'bottom'
+					? Math.abs(rect.bottom - view.bottom) < 16
+					: edge === 'top'
+						? Math.abs(rect.top - view.top) < 16
+						: edge === 'left'
+							? Math.abs(rect.left - view.left) < 16
+							: Math.abs(rect.right - view.right) < 16;
+			if (!marked && !(thin && onEdge)) return;
+			const score = marked
+				? Number.POSITIVE_INFINITY
+				: edge === 'bottom'
+					? rect.top
+					: edge === 'top'
+						? -rect.bottom
+						: edge === 'left'
+							? -rect.right
+							: rect.left;
+			if (!best || score > best.score) best = { leaf, score };
+		});
+		return best?.leaf;
+	}
+
+	private reparentLeaf(leaf: WorkspaceLeaf, tabs: SplitNode): void {
+		const source = splitNode(leaf.parent);
+		if (source === tabs) return;
+		source.removeChild(splitNode(leaf));
+		tabs.insertChild(tabs.children.length, splitNode(leaf));
+	}
+
+	/** Put the first pane on an edge. Does not remove a pane that is already there. */
+	private hoistToEdge(tabs: SplitNode, edge: DockEdge): void {
+		const root = splitNode(this.workspace.rootSplit);
+		if (tabs.parent && tabs.parent !== root) tabs.parent.removeChild(tabs);
+		const span: SplitDirectionName = edge === 'left' || edge === 'right' ? 'vertical' : 'horizontal';
+		const atStart = edge === 'top' || edge === 'left';
+		const container = this.ensureRootSpan(root, span);
+		container.insertChild(atStart ? 0 : container.children.length, tabs);
+		this.markDock(tabs, edge);
+	}
+
+	/** Root splits on the axis that separates this edge from the rest of the window. */
+	private ensureRootSpan(root: SplitNode, span: SplitDirectionName): SplitNode {
+		if (root.direction === span) return root;
+		const nested = root.children.length === 1 && root.children[0].direction === span ? root.children[0] : undefined;
+		if (nested) return nested;
+		const band = this.createSplit(root, span);
+		const existing = root.children.slice();
+		root.insertChild(0, band);
+		for (const child of existing) {
+			if (child === band) continue;
+			child.parent?.removeChild(child);
+			band.insertChild(band.children.length, child);
+		}
+		return band;
+	}
+
+	private createSplit(sibling: SplitNode, direction: SplitDirectionName): SplitNode {
+		const Split = sibling.constructor as new (workspace: unknown, direction: SplitDirectionName) => SplitNode;
+		return new Split(this.workspace, direction);
+	}
+
+	private markDock(tabs: SplitNode, edge: DockEdge): void {
+		const el = (tabs as { containerEl?: HTMLElement }).containerEl;
+		if (!el) return;
+		for (const side of ['left', 'right', 'top', 'bottom'] as const) el.removeClass(`working-tabs-dock-${side}`);
+		el.addClass(`working-tabs-dock-${edge}`);
+	}
+
+	private paneIdOf(tabs: SplitNode): string | undefined {
+		let id: string | undefined;
+		this.workspace.iterateAllLeaves((leaf) => {
+			if (!id && splitNode(leaf.parent) === tabs) id = getPaneId(leaf);
+		});
+		return id;
+	}
+
+	async dockTab(tab: SpaceNode, edge: DockEdge): Promise<void> {
+		await this.dockTabs([tab], edge);
+	}
+
+	/** Peels these tabs into one new pane on an edge. The rest of their group stays. */
+	async dockTabs(tabs: SpaceNode[], edge: DockEdge): Promise<void> {
+		const moving = tabs.filter((tab) => tab.type === 'tab');
+		if (moving.length === 0) return;
+		const leaves: WorkspaceLeaf[] = [];
+		const closed: SpaceNode[] = [];
+		for (const tab of moving) {
+			const open = tab.tabKey ? this.findOpenLeaf(tab.tabKey) : undefined;
+			if (open) leaves.push(open);
+			else closed.push(tab);
+		}
+		const pane = await this.dockLeaves(leaves, edge, closed);
+		if (!pane) return;
+		const paneId = this.paneIdOf(pane);
+		const title = moving.length === 1 ? moving[0].title || this.store.nextDefaultTitle('group') : this.store.nextDefaultTitle('group');
+		const group = await this.store.addGroup(title, null);
+		if (paneId) await this.store.setHomePane(group.id, paneId);
+		for (const tab of moving) {
+			await this.store.clearOrigin(tab.id);
+			await this.store.moveTabRecord(tab.id, group.id);
+		}
+	}
+
+	async dockGroup(id: string, edge: DockEdge): Promise<void> {
+		const group = this.store.find(id);
+		if (!group || group.type !== 'group') return;
+		const records = this.store.children(id).filter((tab) => (tab.viewState || tab.filePath) && !tab.done);
+		const homeId = group.homePaneId;
+		const leaves: WorkspaceLeaf[] = [];
+		const closed: SpaceNode[] = [];
+		for (const tab of records) {
+			const leaf = tab.tabKey ? this.findOpenLeaf(tab.tabKey) : undefined;
+			if (leaf && homeId && getPaneId(leaf) === homeId) leaves.push(leaf);
+			else closed.push(tab);
+		}
+		if (leaves.length === 0 && closed.length === 0) return;
+		const tabs = await this.dockLeaves(leaves, edge, closed);
+		if (!tabs) return;
+		const paneId = this.paneIdOf(tabs);
+		if (paneId) await this.store.setHomePane(id, paneId);
+	}
+
+	/** Open this group in its own pane next to the leaf under the cursor. Does not merge into that leaf's group. */
+	async placeGroupBeside(id: string, anchor: WorkspaceLeaf, zone: DockEdge | 'center'): Promise<void> {
+		const group = this.store.find(id);
+		if (!group || group.type !== 'group') return;
+		const anchorPane = getPaneId(anchor);
+		if (anchorPane && anchorPane === group.homePaneId) {
+			await this.revealGroup(id);
+			return;
+		}
+		const direction: SplitDirectionName =
+			zone === 'top' || zone === 'bottom' ? 'horizontal' : 'vertical';
+		const before = zone === 'left' || zone === 'top';
+		const placeholder = this.workspace.createLeafBySplit(anchor, direction, before);
+		const tabs = splitNode(placeholder.parent);
+		const records = this.store.children(id).filter((tab) => (tab.viewState || tab.filePath) && !tab.done);
+		const homeId = group.homePaneId;
+		const leaves: WorkspaceLeaf[] = [];
+		const closed: SpaceNode[] = [];
+		for (const tab of records) {
+			const leaf = tab.tabKey ? this.findOpenLeaf(tab.tabKey) : undefined;
+			const inDestination = Boolean(leaf && leaf.parent === placeholder.parent);
+			if (inDestination) continue;
+			if (leaf && homeId && getPaneId(leaf) === homeId) leaves.push(leaf);
+			else closed.push(tab);
+		}
+		for (const leaf of leaves) this.reparentLeaf(leaf, tabs);
+		for (const tab of closed) {
+			const leaf = this.workspace.createLeafInParent(placeholder.parent, 9999);
+			await this.openTabInLeaf(leaf, tab);
+		}
+		if (leaves.length > 0 || closed.length > 0) placeholder.detach();
+		const paneId = this.paneIdOf(tabs);
+		if (paneId) await this.store.setHomePane(id, paneId);
+		const focus = leaves[0] ?? this.findLeafInPane(paneId);
+		if (focus) {
+			this.workspace.setActiveLeaf(focus, { focus: true });
+			await this.workspace.revealLeaf(focus);
+		}
+	}
+
+	/** Reveal a group that is already on screen. An off-screen group opens in its own pane, not into whichever group is current. */
+	async showGroup(id: string): Promise<void> {
+		if (this.isRendered(id)) {
+			await this.openGroup(id);
+			return;
+		}
+		await this.openGroup(id, { mode: 'split', direction: 'vertical' });
+	}
+
+	/** Take the group's pane off the screen. The sidebar row stays. */
+	async hideGroup(id: string): Promise<void> {
+		await this.closeGroup(id);
+	}
+
 	private createLeafFor(behavior: OpenBehavior): WorkspaceLeaf {
 		switch (behavior.mode) {
 			case 'split': {
@@ -561,15 +856,42 @@ export class LeafSync {
 	/** viewState works for any view type (terminal, web viewer, canvas, notes
 	 * with their scroll/mode preserved) and is preferred whenever present;
 	 * plain openFile() is only a fallback for simple file tabs that don't
-	 * have one captured. */
+	 * have one captured. A tab we only know by its view type (a terminal whose
+	 * scrollback was not stored, an empty tab) still opens, so Show is not a no-op. */
 	private async openTabInLeaf(leaf: WorkspaceLeaf, tab: SpaceNode): Promise<void> {
-		if (tab.viewState) {
-			await leaf.setViewState({ ...(tab.viewState as ViewState), active: true });
-			return;
+		const openEmpty = async () => {
+			await leaf.setViewState({ type: 'empty', active: true });
+		};
+		try {
+			const stored = tab.viewState as ViewState | undefined;
+			if (stored?.type && stored.type !== 'empty') {
+				await leaf.setViewState({ ...stored, active: true });
+				return;
+			}
+			if (tab.filePath) {
+				const file = this.app.vault.getAbstractFileByPath(tab.filePath);
+				if (file instanceof TFile) {
+					await leaf.openFile(file);
+					return;
+				}
+			}
+			const type = this.viewTypeFromKey(tab.tabKey);
+			if (type) {
+				await leaf.setViewState({ type, active: true });
+				return;
+			}
+			await openEmpty();
+		} catch {
+			await openEmpty();
 		}
-		if (!tab.filePath) return;
-		const file = this.app.vault.getAbstractFileByPath(tab.filePath);
-		if (file instanceof TFile) await leaf.openFile(file);
+	}
+
+	/** `terminus-view:<leafId>` and similar keys name the view. File paths do not. */
+	private viewTypeFromKey(tabKey: string | undefined): string | undefined {
+		if (!tabKey) return undefined;
+		const type = tabKey.split(':')[0];
+		if (!type || type === 'empty' || type.includes('/') || type.includes('.')) return undefined;
+		return type;
 	}
 
 	/** Whether a group currently has a live pane. */
@@ -593,10 +915,19 @@ export class LeafSync {
 	 * e.g. it was just un-done). */
 	async focusTab(tab: SpaceNode): Promise<void> {
 		if (tab.type !== 'tab' || !tab.parentId) return;
-		let leaf = this.findOpenLeaf(tab.tabKey);
+		const group = this.store.find(tab.parentId);
+		const paneId = group?.type === 'group' ? group.homePaneId : undefined;
+		let leaf =
+			paneId && tab.tabKey
+				? this.leavesInPane(paneId).find((item) => this.getTabIdentity(item).key === tab.tabKey)
+				: undefined;
 		if (!leaf && this.isLive(tab.parentId)) {
 			await this.reopenTab(tab);
-			leaf = this.findOpenLeaf(tab.tabKey);
+			const home = this.store.find(tab.parentId);
+			leaf =
+				home?.type === 'group' && home.homePaneId && tab.tabKey
+					? this.leavesInPane(home.homePaneId).find((item) => this.getTabIdentity(item).key === tab.tabKey)
+					: undefined;
 		}
 		if (!leaf) return;
 		await leaf.loadIfDeferred();
@@ -641,14 +972,14 @@ export class LeafSync {
 			}
 		}
 
-		const tabs = this.store.children(id).filter((t) => t.viewState || t.filePath);
+		const tabs = this.store.children(id).filter((tab) => tab.type === 'tab' && !tab.done);
 		if (tabs.length === 0) return;
 
 		const behavior = behaviorOverride ?? group.openBehavior ?? this.store.settings.defaultOpenBehavior;
-		if (behavior.mode === 'tab') return;
+		if (!behaviorOverride && behavior.mode === 'tab') return;
 		if (behaviorOverride && behaviorOverride.mode !== 'tab') await this.store.setOpenBehavior(id, behaviorOverride);
 
-		const first = this.createLeafFor(behavior);
+		const first = this.createLeafFor(behaviorOverride ?? behavior);
 
 		const paneId = getPaneId(first);
 		if (paneId) await this.store.setHomePane(id, paneId);
@@ -792,17 +1123,90 @@ export class LeafSync {
 	/** Moves a tab's record and, when the target group is live, its leaf.
 	 * An open leaf is not filed onto a dormant group — that split the record from the pane. */
 	async moveTab(tab: SpaceNode, toGroupId: string, index: number): Promise<void> {
-		if (tab.type !== 'tab') return;
-		const target = this.store.find(toGroupId);
+		await this.sendToGroup([tab], toGroupId, index);
+	}
+
+	/** Files tabs in a section pool. Open leaves stay in the pane they are already in. */
+	async sendToPool(tabs: SpaceNode[], sectionId: string): Promise<void> {
+		await this.store.batch(async () => {
+			for (const tab of tabs) {
+				if (tab.type === 'tab') await this.store.parkInPool(tab.id, sectionId);
+			}
+		});
+	}
+
+	/** Sends tabs to a named group, which becomes their home. Does not reveal that pane.
+	 * A dormant group receives the record and the open leaf is closed, so the view stays put. */
+	async sendToGroup(tabs: SpaceNode[], groupId: string, index?: number): Promise<void> {
+		const target = this.store.find(groupId);
 		if (!target || target.type !== 'group') return;
-		const targetLive = Boolean(target.homePaneId && this.findLeafInPane(target.homePaneId));
-		if (!targetLive && this.findOpenLeaf(tab.tabKey)) return;
-		await this.store.moveInto(tab.id, toGroupId, index);
-		if (!targetLive) return;
-		const updated = this.store.find(tab.id);
-		if (!updated) return;
-		if (this.findOpenLeaf(updated.tabKey)) await this.relocateLiveLeaf(updated);
-		else await this.reopenTab(updated);
+		const live = Boolean(target.homePaneId && this.findLeafInPane(target.homePaneId));
+		await this.store.batch(async () => {
+			let at = index ?? this.store.children(groupId).filter((child) => !tabs.some((tab) => tab.id === child.id)).length;
+			for (const tab of tabs) {
+				if (tab.type !== 'tab') continue;
+				const parent = tab.parentId ? this.store.find(tab.parentId) : undefined;
+				if (parent?.type === 'group' && parent.id === groupId) {
+					await this.store.moveInto(tab.id, groupId, at);
+					at += 1;
+					if (live) {
+						const updated = this.store.find(tab.id);
+						if (updated && this.findOpenLeaf(updated.tabKey)) await this.relocateLiveLeaf(updated);
+					}
+					continue;
+				}
+				await this.store.clearOrigin(tab.id);
+				if (!live) this.findOpenLeaf(tab.tabKey)?.detach();
+				await this.store.moveInto(tab.id, groupId, at);
+				at += 1;
+				if (!live) continue;
+				const updated = this.store.find(tab.id);
+				if (!updated) continue;
+				const open = this.findOpenLeaf(updated.tabKey);
+				if (open && getPaneId(open) === target.homePaneId) continue;
+				if (open) await this.relocateLiveLeaf(updated);
+				else await this.reopenTab(updated);
+			}
+		});
+	}
+
+	/** Puts pooled tabs back in the groups they left. Does not move leaves. */
+	async restoreTabs(tabs: SpaceNode[]): Promise<void> {
+		await this.store.batch(async () => {
+			for (const tab of tabs) {
+				if (tab.type === 'tab') await this.store.restoreOrigin(tab.id);
+			}
+		});
+	}
+
+	/** Show a leaf that is already open. Does not create a pane or move a tab. */
+	async revealOpenTab(tab: SpaceNode): Promise<void> {
+		const leaf = this.leafForTab(tab);
+		if (!leaf) return;
+		await leaf.loadIfDeferred();
+		this.workspace.setActiveLeaf(leaf, { focus: true });
+		await this.workspace.revealLeaf(leaf);
+	}
+
+	/** Show a group's pane when it is already on screen. */
+	async revealGroup(groupId: string): Promise<void> {
+		const group = this.store.find(groupId);
+		if (!group || group.type !== 'group') return;
+		const leaf = this.findLeafInPane(group.homePaneId);
+		if (!leaf) return;
+		await leaf.loadIfDeferred();
+		this.workspace.setActiveLeaf(leaf, { focus: true });
+		await this.workspace.revealLeaf(leaf);
+	}
+
+	/** The open leaf for this tab, if it is on screen. */
+	leafForTab(tab: SpaceNode): WorkspaceLeaf | undefined {
+		return tab.tabKey ? this.findOpenLeaf(tab.tabKey) : undefined;
+	}
+
+	/** The group that claims the pane this leaf is open in. */
+	groupForLeaf(leaf: WorkspaceLeaf): SpaceNode | undefined {
+		return this.findOwningGroupByPane(getPaneId(leaf));
 	}
 
 	async moveTabToNewGroup(tab: SpaceNode, direction: 'vertical' | 'horizontal'): Promise<void> {
@@ -885,18 +1289,17 @@ export class LeafSync {
 		this.workspace.setActiveLeaf(leaf, { focus: true });
 	}
 
-	/** Detaches a tab's live leaf (if its group is live and that tab is
-	 * actually open in its pane) without touching stored data -- used both by
-	 * the "mark done" checkbox (keep the record, just close it) and as the
-	 * first half of closeTab (which also forgets the record). */
+	/** Detaches this tab's leaf only when it is open in this tab's own group.
+	 * A hibernating copy of the same file must not close the leaf that belongs
+	 * to another group. */
 	async closeLiveTabOnly(tab: SpaceNode): Promise<void> {
-		if (tab.type !== 'tab' || !tab.parentId || !tab.tabKey) return;
-		const group = this.store.find(tab.parentId);
+		if (tab.type !== 'tab' || !tab.tabKey) return;
+		const group = tab.parentId ? this.store.find(tab.parentId) : undefined;
 		if (group?.type !== 'group' || !group.homePaneId) return;
-		const matches = this.leavesInPane(group.homePaneId).filter(
-			(l) => this.getTabIdentity(l).key === tab.tabKey
+		const match = this.leavesInPane(group.homePaneId).find(
+			(leaf) => this.getTabIdentity(leaf).key === tab.tabKey
 		);
-		for (const match of matches) match.detach();
+		match?.detach();
 	}
 
 	/** How many of `tab`'s siblings (by stored order) currently have a live

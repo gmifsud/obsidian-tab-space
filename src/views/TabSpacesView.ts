@@ -5,6 +5,8 @@ import type { SpaceNode, OpenBehavior, ColorSlot } from '../types';
 import { VIEW_TYPE_WORKING_TABS, COMPLETED_PARENT_ID, COLOR_SLOTS, COLOR_LABELS } from '../types';
 import { ConfirmCompleteModal } from '../modals/ConfirmCompleteModal';
 import { GroupDescriptionModal } from '../modals/GroupDescriptionModal';
+import { TabPreviewModal } from '../modals/TabPreviewModal';
+import { addSendItems } from '../pane-menus';
 
 /** A real swatch beside each colour name in the menu -- Obsidian's MenuItem
  * takes a DocumentFragment for its title, which is the only way to get colour
@@ -19,6 +21,17 @@ function colorMenuTitle(slot: ColorSlot): DocumentFragment {
 
 type DropPosition = 'before' | 'after' | 'into';
 
+/** True for a real text field. Checkbox/radio stay out so a focused row checkbox doesn't swallow Backspace. */
+function isTextField(target: EventTarget | null): boolean {
+	if (!(target instanceof HTMLElement)) return false;
+	if (target.isContentEditable) return true;
+	if (target.closest('[contenteditable="true"]')) return true;
+	if (target.tagName === 'TEXTAREA') return true;
+	if (target.tagName !== 'INPUT') return false;
+	const type = (target as HTMLInputElement).type;
+	return type !== 'checkbox' && type !== 'radio' && type !== 'button' && type !== 'submit' && type !== 'file' && type !== 'hidden' && type !== 'range';
+}
+
 const PLACEMENT_MENU: Array<{ label: string; behavior: OpenBehavior }> = [
 	{ label: 'Split right', behavior: { mode: 'split', direction: 'vertical' } },
 	{ label: 'Split down', behavior: { mode: 'split', direction: 'horizontal' } },
@@ -30,9 +43,15 @@ export class TabSpacesView extends ItemView {
 	private treeEl!: HTMLElement;
 	private draggedId: string | null = null;
 	private dropMarkedEl: HTMLElement | null = null;
+	private viewportDropEl: HTMLElement | null = null;
+	private viewportDropZone: string | null = null;
+	/** The dragged row is the drag image. Rebuilding the tree mid-drag detaches it and Chromium throws `null.clone` on every dragover. */
+	private renderAfterDrag = false;
 	private unsubscribe: (() => void) | null = null;
 	private visibleOrder: string[] = [];
 	private focusedId: string | null = null;
+	/** Ctrl-click selection. A later Send applies to every id in here. */
+	private selectedTabIds = new Set<string>();
 	/** While set, store-driven re-renders are deferred so the inline rename input isn't destroyed mid-edit. */
 	private renamingId: string | null = null;
 	private completedCollapsed = true;
@@ -73,18 +92,24 @@ export class TabSpacesView extends ItemView {
 			this.render();
 		});
 		this.searchInputEl.addEventListener('keydown', (evt) => {
-			if (evt.key === 'Escape') {
-				evt.preventDefault();
-				this.clearSearch();
-			}
+			if (evt.key !== 'Escape') return;
+			evt.stopPropagation();
+			evt.preventDefault();
+			this.clearSearch();
 		});
 
-		this.treeEl = container.createDiv({ cls: 'working-tabs-tree', attr: { tabindex: '0' } });
+		// Not focusable. A tabindex here becomes the keyboard target, and Backspace
+		// then deletes the selected row instead of editing the note or a field.
+		this.treeEl = container.createDiv({ cls: 'working-tabs-tree' });
 		this.registerRootDropZone(this.treeEl);
-		this.treeEl.addEventListener('keydown', (evt) => this.handleKeydown(evt));
+		this.registerViewportDrop();
 
 		this.unsubscribe = this.store.onChange(() => {
 			if (this.renamingId) return;
+			if (this.draggedId) {
+				this.renderAfterDrag = true;
+				return;
+			}
 			this.render();
 		});
 		this.registerEvent(
@@ -96,31 +121,11 @@ export class TabSpacesView extends ItemView {
 		this.render();
 	}
 
-	/** The reverse of clicking a tab: when it becomes active in the workspace
-	 * (clicked directly, or switched to via keyboard), expand whatever
-	 * group/section/Completed bucket it's tucked inside so the highlighted
-	 * row is actually visible, not just technically focused. */
+	/** Highlight the active tab's row. A collapsed group stays collapsed — the
+	 * active leaf used to expand it again, so a group that contained the open
+	 * tab (or two copies of it) could never stay closed. */
 	private async revealNode(node: SpaceNode): Promise<void> {
-		let parentId = node.parentId;
-		while (parentId) {
-			if (parentId === COMPLETED_PARENT_ID) {
-				if (this.completedCollapsed) {
-					this.completedCollapsed = false;
-					this.render();
-				}
-				break;
-			}
-			const parent = this.store.find(parentId);
-			if (!parent) break;
-			if ((parent.type === 'group' || parent.type === 'section') && parent.collapsed) {
-				await this.store.toggleCollapsed(parent.id);
-			}
-			parentId = parent.parentId;
-		}
-		// Highlight only -- this runs off active-leaf-change, i.e. in response
-		// to the user focusing something in the workspace, so it must leave the
-		// keyboard exactly where they just put it.
-		this.setFocus(node.id, { takeKeyboardFocus: false });
+		this.highlightRow(node.id);
 	}
 
 	private clearSearch(): void {
@@ -146,6 +151,16 @@ export class TabSpacesView extends ItemView {
 	// ── Rendering ────────────────────────────────────────────
 
 	private render(): void {
+		if (this.draggedId) {
+			this.renderAfterDrag = true;
+			return;
+		}
+		// Rebuilding the tree drops its scroll offset. A click lower down, on a
+		// hibernating group, would otherwise jump back to the on-screen group.
+		// The scroller may be the tree or an Obsidian ancestor, depending on
+		// which one currently overflows.
+		const scroller = this.scrollOwner();
+		const scrollTop = scroller.scrollTop;
 		this.contentEl.toggleClass('working-tabs-wrap-titles', this.store.settings.titleOverflow === 'wrap');
 		this.treeEl.empty();
 		this.visibleOrder = [];
@@ -160,28 +175,29 @@ export class TabSpacesView extends ItemView {
 					: 'No groups yet -- open some tabs to create one automatically.',
 			});
 		}
-		// Sections always sit below every root-level group, so the top of the
-		// panel reads as "what's live right now" -- relative order *within*
-		// each type still comes from the stored order (drag-to-reorder), this
-		// only separates the two types from each other. The two "+" rows sit
-		// between the blocks as a pair: "New group" closes out the groups it
-		// appends to, "Create a section" heads the sections block it appends
-		// to, so both containers read as peers you can make from one spot.
-		// While a section is focused it renders first among sections.
+		// Three clusters, never mixed: groups whose pane is on screen, groups that
+		// are hibernating, then sections. Order inside a cluster is still the
+		// stored order. A focused section renders first among sections.
 		const focusedSectionId = this.store.focusedSectionId;
-		for (const node of roots.filter((n) => n.type === 'group')) this.renderNode(this.treeEl, node, 0, false, query);
-		if (!query) {
-			this.renderNewGroupRow();
-			this.renderCreateSectionRow();
-		}
-		const sections = roots.filter((n) => n.type === 'section');
+		const rootGroups = roots.filter((node) => node.type === 'group');
+		const onScreen = rootGroups.filter((group) => this.plugin.leafSync.isRendered(group.id));
+		const hibernating = rootGroups.filter((group) => !this.plugin.leafSync.isRendered(group.id));
+		const sections = roots.filter((node) => node.type === 'section');
 		const orderedSections = focusedSectionId
 			? [
-					...sections.filter((n) => n.id === focusedSectionId),
-					...sections.filter((n) => n.id !== focusedSectionId),
+					...sections.filter((node) => node.id === focusedSectionId),
+					...sections.filter((node) => node.id !== focusedSectionId),
 				]
 			: sections;
-		for (const node of orderedSections) this.renderNode(this.treeEl, node, 0, false, query);
+
+		this.renderCluster('On screen', 'onscreen', onScreen, query ? undefined : (parent) => this.renderNewGroupRow(parent));
+		this.renderCluster('Hibernating', 'hibernating', hibernating);
+		this.renderCluster(
+			'Sections',
+			'sections',
+			orderedSections,
+			query ? undefined : (parent) => this.renderCreateSectionRow(parent)
+		);
 
 		this.treeEl.createDiv({ cls: 'working-tabs-divider' });
 
@@ -193,6 +209,36 @@ export class TabSpacesView extends ItemView {
 			query
 		);
 		if (this.focusedId) this.showWhetherOnScreen(this.focusedId);
+		scroller.scrollTop = scrollTop;
+	}
+
+	/** The element that is actually scrolled. The tree is the intended one; an ancestor wins if that is where the offset lives. */
+	private scrollOwner(): HTMLElement {
+		let el: HTMLElement | null = this.treeEl;
+		while (el) {
+			const overflow = getComputedStyle(el).overflowY;
+			if ((overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay') && el.scrollHeight > el.clientHeight + 1) {
+				return el;
+			}
+			el = el.parentElement;
+		}
+		return this.treeEl;
+	}
+
+	private renderCluster(
+		title: string,
+		kind: 'onscreen' | 'hibernating' | 'sections',
+		nodes: SpaceNode[],
+		extra?: (parent: HTMLElement) => void
+	): void {
+		if (nodes.length === 0 && !extra) return;
+		const cluster = this.treeEl.createDiv({ cls: `working-tabs-cluster is-${kind}` });
+		const label = cluster.createDiv({ cls: 'working-tabs-cluster-label' });
+		label.createSpan({ cls: 'working-tabs-cluster-name', text: title });
+		label.createSpan({ cls: 'working-tabs-count', text: String(nodes.length) });
+		const query = this.searchQuery.trim().toLowerCase();
+		for (const node of nodes) this.renderNode(cluster, node, 0, false, query);
+		extra?.(cluster);
 	}
 
 	private renderNode(parentEl: HTMLElement, node: SpaceNode, depth: number, isCompleted: boolean, query: string): void {
@@ -208,21 +254,34 @@ export class TabSpacesView extends ItemView {
 		});
 		this.wireDrag(row, node);
 
-		// Same custom property the pane's stripe uses, so a row and the pane it
-		// stands for are literally reading the same colour -- that's the whole
-		// point of the coding, and it stops the two drifting apart. Tabs
-		// resolve to nothing and stay unstyled.
-		const slot = this.store.effectiveColor(node);
-		if (slot) {
+		// The group colour is the tab colour: a sidebar row and the pane tabs read
+		// the same slot. A tab has no colour of its own, so it uses its group
+		// (or its section, when it is parked in a pool).
+		const accent = this.store.accentCss(node);
+		if (accent) {
 			row.addClass('working-tabs-colored');
-			row.style.setProperty('--working-tabs-accent', `var(--working-tabs-color-${slot})`);
+			row.style.setProperty('--working-tabs-accent', accent);
 		}
 
 		this.visibleOrder.push(node.id);
 		if (node.id === this.focusedId) row.addClass('is-focused');
 		row.addEventListener('mousedown', (evt) => {
-			if ((evt.target as HTMLElement).tagName === 'INPUT') return;
-			this.setFocus(node.id);
+			if (evt.button !== 0 || isTextField(evt.target)) return;
+			if ((evt.ctrlKey || evt.metaKey) && node.type === 'tab') {
+				if (this.selectedTabIds.has(node.id)) {
+					this.selectedTabIds.delete(node.id);
+					row.removeClass('is-picked');
+				} else {
+					this.selectedTabIds.add(node.id);
+					row.addClass('is-picked');
+				}
+				return;
+			}
+			if (this.selectedTabIds.size > 0) {
+				this.selectedTabIds.clear();
+				this.treeEl.querySelectorAll<HTMLElement>('.is-picked').forEach((picked) => picked.removeClass('is-picked'));
+			}
+			this.highlightRow(node.id);
 		});
 		return row;
 	}
@@ -260,7 +319,7 @@ export class TabSpacesView extends ItemView {
 		});
 
 		this.wireRowClick(row, () => {
-			if (!query) void this.store.toggleCollapsed(node.id);
+			if (!query) void this.store.setCollapsed(node.id, expanded);
 		});
 		row.addEventListener('contextmenu', (evt) => {
 			evt.preventDefault();
@@ -270,12 +329,54 @@ export class TabSpacesView extends ItemView {
 		if (expanded) {
 			const childWrap = wrapper.createDiv({ cls: 'working-tabs-children' });
 			const children = this.store.children(node.id).filter((c) => !query || this.matchesQuery(c, query));
-			for (const child of children) this.renderNode(childWrap, child, depth + 1, false, query);
+			const pooled = children.filter((child) => child.type === 'tab');
+			this.renderPool(childWrap, node, pooled, query);
+			for (const child of children) {
+				if (child.type !== 'tab') this.renderNode(childWrap, child, depth + 1, false, query);
+			}
 		}
+	}
+
+	private renderPool(parentEl: HTMLElement, section: SpaceNode, tabs: SpaceNode[], query: string): void {
+		if (query && tabs.length === 0) return;
+		const pool = parentEl.createDiv({ cls: 'working-tabs-pool' });
+		pool.createDiv({ cls: 'working-tabs-pool-label', text: 'Pool' });
+		if (tabs.length === 0) {
+			pool.createDiv({ cls: 'working-tabs-pool-empty', text: 'Send tabs here. They stay open.' });
+		}
+		for (const tab of tabs) this.renderNode(pool, tab, 1, false, query);
+		pool.addEventListener('dragover', (evt) => {
+			const dragged = this.draggedId ? this.store.find(this.draggedId) : undefined;
+			if (dragged?.type !== 'tab') return;
+			evt.preventDefault();
+			pool.addClass('is-drop');
+		});
+		pool.addEventListener('dragleave', () => pool.removeClass('is-drop'));
+		pool.addEventListener('drop', (evt) => {
+			pool.removeClass('is-drop');
+			const dragged = this.draggedId ? this.store.find(this.draggedId) : undefined;
+			if (dragged?.type !== 'tab') return;
+			evt.preventDefault();
+			evt.stopPropagation();
+			const tabsToSend =
+				this.selectedTabIds.has(dragged.id) && this.selectedTabIds.size > 1
+					? this.selectedTabs()
+					: [dragged];
+			void this.plugin.leafSync.sendToPool(tabsToSend, section.id);
+		});
 	}
 
 	private isLive(node: SpaceNode): boolean {
 		return this.plugin.leafSync.isLive(node.id);
+	}
+
+	private selectedTabs(): SpaceNode[] {
+		const tabs: SpaceNode[] = [];
+		for (const id of this.selectedTabIds) {
+			const node = this.store.find(id);
+			if (node?.type === 'tab') tabs.push(node);
+		}
+		return tabs;
 	}
 
 	private renderGroup(parentEl: HTMLElement, node: SpaceNode, depth: number, isCompleted: boolean, query: string): void {
@@ -295,7 +396,8 @@ export class TabSpacesView extends ItemView {
 		setIcon(chevron, expanded ? 'chevron-down' : 'chevron-right');
 		chevron.addEventListener('click', (evt) => {
 			evt.stopPropagation();
-			if (!query) void this.store.toggleCollapsed(node.id);
+			evt.preventDefault();
+			if (!query) void this.store.setCollapsed(node.id, expanded);
 		});
 
 		const textCol = row.createDiv({ cls: 'working-tabs-text-col' });
@@ -305,28 +407,39 @@ export class TabSpacesView extends ItemView {
 		this.wireRename(title, node);
 		const tabCount = this.store.children(node.id).length;
 		titleRow.createSpan({ cls: 'working-tabs-count', text: String(tabCount) });
+		if (live) titleRow.createSpan({ cls: 'working-tabs-live-chip', text: 'on screen' });
 		titleRow.createSpan({ cls: 'working-tabs-screen-state' });
 		if (node.description) {
 			textCol.createDiv({ cls: 'working-tabs-description', text: node.description });
 		}
 
 		const actions = row.createDiv({ cls: 'working-tabs-row-actions' });
-		this.makeGroupActionButton(
-			actions,
-			isCompleted ? 'rotate-ccw' : 'check-circle',
-			isCompleted ? 'Restore' : 'Complete',
-			(evt) => {
+		if (isCompleted) {
+			this.makeGroupActionButton(actions, 'rotate-ccw', 'Restore', (evt) => {
 				evt.stopPropagation();
-				if (isCompleted) void this.store.restore(node.id);
-				else this.requestComplete(node);
-			}
-		);
+				void this.store.restore(node.id);
+			});
+		} else if (live) {
+			this.makeGroupActionButton(actions, 'eye-off', 'Hide', (evt) => {
+				evt.stopPropagation();
+				void this.plugin.leafSync.hideGroup(node.id);
+			});
+		} else {
+			this.makeGroupActionButton(actions, 'eye', 'Show', (evt) => {
+				evt.stopPropagation();
+				void this.plugin.leafSync.showGroup(node.id);
+			});
+		}
 		this.makeGroupActionButton(actions, 'ellipsis-vertical', 'More', (evt) => {
 			evt.stopPropagation();
 			this.showGroupMenu(node, evt, isCompleted);
 		});
 
-		this.wireRowClick(row, () => void this.store.toggleCollapsed(node.id));
+		this.wireRowClick(row, (evt) => {
+			if (query) return;
+			if (evt.target instanceof Element && evt.target.closest('.working-tabs-chevron, .working-tabs-row-actions')) return;
+			void this.store.setCollapsed(node.id, expanded);
+		});
 		row.addEventListener('contextmenu', (evt) => {
 			evt.preventDefault();
 			this.showGroupMenu(node, evt, isCompleted);
@@ -347,11 +460,17 @@ export class TabSpacesView extends ItemView {
 	): void {
 		const btn = parent.createDiv({ cls: 'working-tabs-action-btn', attr: { 'aria-label': label } });
 		setIcon(btn, icon);
+		setTooltip(btn, label, { placement: 'top' });
 		btn.addEventListener('click', onClick);
 	}
 
 	private renderTab(parentEl: HTMLElement, node: SpaceNode, depth: number): void {
-		const row = this.renderRowShell(parentEl, node, depth, 'working-tabs-tab-row');
+		const row = this.renderRowShell(
+			parentEl,
+			node,
+			depth,
+			`working-tabs-tab-row${this.selectedTabIds.has(node.id) ? ' is-picked' : ''}`
+		);
 
 		const checkbox = row.createEl('input', {
 			cls: 'working-tabs-done-checkbox',
@@ -363,7 +482,11 @@ export class TabSpacesView extends ItemView {
 
 		const title = row.createSpan({ cls: `working-tabs-title${node.done ? ' is-done' : ''}` });
 		title.setText(node.title);
-		this.wireRename(title, node);
+		const parent = node.parentId ? this.store.find(node.parentId) : undefined;
+		if (parent?.type === 'section' && node.originGroupId) {
+			const home = this.store.find(node.originGroupId);
+			if (home) row.createSpan({ cls: 'working-tabs-origin', text: `returns to ${home.title}` });
+		}
 
 		const actions = row.createDiv({ cls: 'working-tabs-row-actions' });
 		this.makeGroupActionButton(actions, 'x', 'Close tab', (evt) => {
@@ -371,10 +494,36 @@ export class TabSpacesView extends ItemView {
 			void this.plugin.leafSync.closeTab(node);
 		});
 
-		this.wireRowClick(row, () => void this.plugin.leafSync.focusTab(node));
+		let pendingReveal: number | null = null;
+		row.addEventListener('click', (evt) => {
+			if (evt.ctrlKey || evt.metaKey) return;
+			if (evt.target instanceof Element && evt.target.closest('.working-tabs-done-checkbox, .working-tabs-row-actions')) return;
+			if (evt.detail > 1) {
+				if (pendingReveal !== null) window.clearTimeout(pendingReveal);
+				pendingReveal = null;
+				return;
+			}
+			if (pendingReveal !== null) window.clearTimeout(pendingReveal);
+			pendingReveal = window.setTimeout(() => {
+				pendingReveal = null;
+				void this.plugin.leafSync.revealOpenTab(node);
+			}, 200);
+		});
+		row.addEventListener('dblclick', (evt) => {
+			if (evt.target instanceof Element && evt.target.closest('.working-tabs-done-checkbox, .working-tabs-row-actions')) return;
+			evt.preventDefault();
+			evt.stopPropagation();
+			new TabPreviewModal(this.app, {
+				title: node.title,
+				filePath: node.filePath,
+				viewState: node.viewState,
+			}).open();
+		});
 		row.addEventListener('contextmenu', (evt) => {
 			evt.preventDefault();
-			this.showTabMenu(node, evt);
+			const tabs =
+				this.selectedTabIds.has(node.id) && this.selectedTabIds.size > 1 ? this.selectedTabs() : [node];
+			this.showTabMenu(tabs, evt);
 		});
 	}
 
@@ -383,8 +532,8 @@ export class TabSpacesView extends ItemView {
 	 * doReconcile's step 4 and LeafSync.openNewGroup) -- so this row doesn't
 	 * create a group record either. It only opens a blank pane per the
 	 * chosen placement and lets that same auto-detection name it. */
-	private renderNewGroupRow(): void {
-		const row = this.treeEl.createDiv({ cls: 'working-tabs-row working-tabs-new-group-row' });
+	private renderNewGroupRow(parent: HTMLElement): void {
+		const row = parent.createDiv({ cls: 'working-tabs-row working-tabs-new-group-row' });
 		const icon = row.createDiv({ cls: 'working-tabs-chevron' });
 		setIcon(icon, 'plus');
 		row.createSpan({ cls: 'working-tabs-title', text: 'New group' });
@@ -400,8 +549,8 @@ export class TabSpacesView extends ItemView {
 	/** Heads the sections block, paired with "New group" above it. The info
 	 * icon is the only explanation of what a section is *for*, so it rides
 	 * along on the row (revealed on hover) rather than staying in the chrome. */
-	private renderCreateSectionRow(): void {
-		const row = this.treeEl.createDiv({ cls: 'working-tabs-row working-tabs-create-section-row' });
+	private renderCreateSectionRow(parent: HTMLElement): void {
+		const row = parent.createDiv({ cls: 'working-tabs-row working-tabs-create-section-row' });
 		const icon = row.createDiv({ cls: 'working-tabs-chevron' });
 		setIcon(icon, 'plus');
 		row.createSpan({ cls: 'working-tabs-title', text: 'Create a section' });
@@ -505,28 +654,14 @@ export class TabSpacesView extends ItemView {
 
 	// ── Keyboard navigation ──────────────────────────────────
 
-	/**
-	 * Marks a row as the keyboard-navigation cursor and scrolls it into view.
-	 *
-	 * `takeKeyboardFocus` is what separates "the user is driving this panel"
-	 * from "this panel is reflecting something that happened elsewhere". Moving
-	 * DOM focus to the tree is right for the first -- a click on a row, an
-	 * arrow key -- and actively harmful for the second: highlighting the row
-	 * for whichever leaf just became active is a *response* to the user
-	 * focusing something else in the workspace, so stealing the keyboard back
-	 * takes it away from the thing they just deliberately clicked into. A
-	 * terminal is where that's felt hardest, since a pane that has lost focus
-	 * looks identical to one that is simply refusing to accept typing.
-	 */
-	private setFocus(id: string, { takeKeyboardFocus = true }: { takeKeyboardFocus?: boolean } = {}): void {
+	/** Highlight only. No layout read, so it cannot force a reflow under the caret. */
+	private highlightRow(id: string): void {
 		const prevId = this.focusedId;
 		this.focusedId = id;
-		if (prevId) this.treeEl.querySelector<HTMLElement>(`[data-node-id="${prevId}"]`)?.removeClass('is-focused');
-		const el = this.treeEl.querySelector<HTMLElement>(`[data-node-id="${id}"]`);
-		el?.addClass('is-focused');
-		el?.scrollIntoView({ block: 'nearest' });
-		if (takeKeyboardFocus) this.treeEl.focus();
-		this.showWhetherOnScreen(id);
+		if (prevId && prevId !== id) {
+			this.treeEl.querySelector<HTMLElement>(`[data-node-id="${prevId}"]`)?.removeClass('is-focused');
+		}
+		this.treeEl.querySelector<HTMLElement>(`[data-node-id="${id}"]`)?.addClass('is-focused');
 	}
 
 	/** On the selected group, say if its pane is actually visible, and outline that pane. */
@@ -553,83 +688,21 @@ export class TabSpacesView extends ItemView {
 		this.plugin.leafSync.markSelectedPane(onScreen ? node.id : null);
 	}
 
-	private moveFocus(delta: number): void {
-		if (this.visibleOrder.length === 0) return;
-		const currentIndex = this.focusedId ? this.visibleOrder.indexOf(this.focusedId) : -1;
-		const nextIndex = Math.max(0, Math.min(this.visibleOrder.length - 1, currentIndex + delta));
-		const nextId = this.visibleOrder[nextIndex];
-		if (nextId) this.setFocus(nextId);
-	}
-
-	private handleKeydown(evt: KeyboardEvent): void {
-		if (!this.focusedId) {
-			if (evt.key === 'ArrowDown' || evt.key === 'ArrowUp') {
-				evt.preventDefault();
-				this.moveFocus(evt.key === 'ArrowDown' ? 1 : -1);
-			}
-			return;
-		}
-		const node = this.store.find(this.focusedId);
-		if (!node) return;
-
-		switch (evt.key) {
-			case 'ArrowDown':
-				evt.preventDefault();
-				this.moveFocus(1);
-				break;
-			case 'ArrowUp':
-				evt.preventDefault();
-				this.moveFocus(-1);
-				break;
-			case 'ArrowRight':
-				evt.preventDefault();
-				if ((node.type === 'group' || node.type === 'section') && node.collapsed) {
-					void this.store.toggleCollapsed(node.id);
-				} else {
-					this.moveFocus(1);
-				}
-				break;
-			case 'ArrowLeft':
-				evt.preventDefault();
-				if ((node.type === 'group' || node.type === 'section') && !node.collapsed) {
-					void this.store.toggleCollapsed(node.id);
-				} else if (node.parentId && this.store.find(node.parentId)) {
-					this.setFocus(node.parentId);
-				}
-				break;
-			case 'Enter':
-				evt.preventDefault();
-				if (node.type === 'section') void this.store.toggleCollapsed(node.id);
-				else if (node.type === 'group') void this.store.toggleCollapsed(node.id);
-				else void this.plugin.leafSync.focusTab(node);
-				break;
-			case 'F2': {
-				evt.preventDefault();
-				const titleEl = this.treeEl.querySelector<HTMLElement>(`[data-node-id="${node.id}"] .working-tabs-title`);
-				if (titleEl) this.startRename(titleEl, node);
-				break;
-			}
-			case 'Delete':
-			case 'Backspace':
-				evt.preventDefault();
-				void this.deleteNode(node);
-				break;
-		}
-	}
-
-	/** Delaying the click action lets a following second click cancel it, so double-clicking the title renames instead of opening/toggling first. */
-	private wireRowClick(row: HTMLElement, action: () => void): void {
+	/** A second click in a double-click is the rename, so it does not also toggle. */
+	/** Wait briefly so a double-click can rename instead of also collapsing. */
+	private wireRowClick(row: HTMLElement, action: (evt: MouseEvent) => void): void {
 		let pending: number | null = null;
-		row.addEventListener('click', () => {
-			if (pending !== null) {
-				window.clearTimeout(pending);
+		row.addEventListener('click', (evt) => {
+			if (evt.detail > 1) {
+				if (pending !== null) window.clearTimeout(pending);
 				pending = null;
 				return;
 			}
+			if (pending !== null) window.clearTimeout(pending);
 			pending = window.setTimeout(() => {
 				pending = null;
-				action();
-			}, 250);
+				action(evt);
+			}, 200);
 		});
 	}
 
@@ -671,19 +744,10 @@ export class TabSpacesView extends ItemView {
 		};
 		const onBlur = () => void finish(true);
 		const onKeydown = (evt: KeyboardEvent) => {
-			// Stop every key here, not just Enter/Escape -- otherwise normal
-			// text editing (Backspace, Delete, arrow keys, ...) bubbles up to
-			// the tree's own keydown handler, which treats Backspace/Delete as
-			// "delete this node" and Arrow keys as "move focus" instead of
-			// letting the input edit its own text.
+			if (evt.key !== 'Enter' && evt.key !== 'Escape') return;
 			evt.stopPropagation();
-			if (evt.key === 'Enter') {
-				evt.preventDefault();
-				void finish(true);
-			} else if (evt.key === 'Escape') {
-				evt.preventDefault();
-				void finish(false);
-			}
+			evt.preventDefault();
+			void finish(evt.key === 'Enter');
 		};
 		input.addEventListener('blur', onBlur);
 		input.addEventListener('keydown', onKeydown);
@@ -821,21 +885,66 @@ export class TabSpacesView extends ItemView {
 		menu.showAtMouseEvent(evt);
 	}
 
+	/** Files the whole group under a section. Its tabs stay in the group. */
+	private addSendGroupToSection(menu: Menu, group: SpaceNode): void {
+		const sections = this.store.items.filter((node) => node.type === 'section');
+		if (sections.length === 0) return;
+		let submenu: Menu | null = null;
+		menu.addItem((item) => {
+			item.setTitle('Send to section').setIcon('folder');
+			const opener = item as { setSubmenu?: () => Menu };
+			if (typeof opener.setSubmenu === 'function') submenu = opener.setSubmenu();
+		});
+		if (!submenu) return;
+		const sectionMenu: Menu = submenu;
+		for (const section of sections) {
+			sectionMenu.addItem((item) =>
+				item
+					.setTitle(section.title)
+					.setDisabled(group.parentId === section.id)
+					.onClick(() => {
+						const index = this.store.children(section.id).filter((child) => child.id !== group.id).length;
+						void this.store.moveInto(group.id, section.id, index);
+					})
+			);
+		}
+		const parent = group.parentId ? this.store.find(group.parentId) : undefined;
+		if (parent?.type !== 'section') return;
+		sectionMenu.addSeparator();
+		sectionMenu.addItem((item) =>
+			item.setTitle('Remove from section').onClick(() => {
+				const index = this.store.children(null).filter((child) => child.id !== group.id).length;
+				void this.store.moveInto(group.id, null, index);
+			})
+		);
+	}
+
+	private addDockItems(menu: Menu, dock: (edge: 'left' | 'right' | 'top' | 'bottom') => void): void {
+		const items = [
+			['Dock left', 'left', 'panel-left'],
+			['Dock right', 'right', 'panel-right'],
+			['Dock top', 'top', 'panel-top'],
+			['Dock bottom', 'bottom', 'panel-bottom'],
+		] as const;
+		for (const [title, edge, icon] of items) {
+			menu.addItem((item) => item.setTitle(title).setIcon(icon).onClick(() => dock(edge)));
+		}
+	}
+
 	private showGroupMenu(node: SpaceNode, evt: MouseEvent, isCompleted: boolean): void {
 		const menu = new Menu();
 		if (!isCompleted) {
-			menu.addItem((item) =>
-				item
-					.setTitle('Open in group')
-					.setIcon('folder-open')
-					.onClick(() => void this.plugin.leafSync.openInCurrentGroup(node.id))
-			);
-			menu.addItem((item) =>
-				item
-					.setTitle('Open in new group')
-					.setIcon('plus-square')
-					.onClick(() => void this.plugin.leafSync.openInNewGroup(node.id))
-			);
+			if (this.plugin.leafSync.isRendered(node.id)) {
+				menu.addItem((item) =>
+					item.setTitle('Hide').setIcon('eye-off').onClick(() => void this.plugin.leafSync.hideGroup(node.id))
+				);
+			} else {
+				menu.addItem((item) =>
+					item.setTitle('Show').setIcon('eye').onClick(() => void this.plugin.leafSync.showGroup(node.id))
+				);
+			}
+			this.addSendGroupToSection(menu, node);
+			this.addDockItems(menu, (edge) => void this.plugin.leafSync.dockGroup(node.id, edge));
 			menu.addSeparator();
 			menu.addItem((item) =>
 				item.setTitle('New tab').setIcon('plus').onClick(() => void this.plugin.leafSync.addBlankTab(node.id))
@@ -889,6 +998,11 @@ export class TabSpacesView extends ItemView {
 				item.setTitle('Colour').setIcon('palette').onClick(() => this.showColorMenu(node, evt))
 			);
 		}
+		if (!isCompleted) {
+			menu.addItem((item) =>
+				item.setTitle('Complete').setIcon('check-circle').onClick(() => this.requestComplete(node))
+			);
+		}
 		menu.addSeparator();
 		menu.addItem((item) =>
 			item.setTitle('Delete permanently').setIcon('trash').onClick(() => void this.deleteNode(node))
@@ -896,37 +1010,31 @@ export class TabSpacesView extends ItemView {
 		menu.showAtMouseEvent(evt);
 	}
 
-	private showTabMenu(node: SpaceNode, evt: MouseEvent): void {
+	private showTabMenu(tabs: SpaceNode[], evt: MouseEvent): void {
 		const menu = new Menu();
-		menu.addItem((item) =>
-			item.setTitle(node.done ? 'Mark not done' : 'Mark done').setIcon('check').onClick(() => void this.store.toggleDone(node.id))
-		);
-		menu.addSeparator();
-		menu.addItem((item) =>
-			item
-				.setTitle('Split right')
-				.setIcon('separator-vertical')
-				.onClick(() => void this.plugin.leafSync.moveTabToNewGroup(node, 'vertical'))
-		);
-		menu.addItem((item) =>
-			item
-				.setTitle('Split down')
-				.setIcon('separator-horizontal')
-				.onClick(() => void this.plugin.leafSync.moveTabToNewGroup(node, 'horizontal'))
-		);
-		for (const group of this.store.items.filter(
-			(n) => n.type === 'group' && n.id !== node.parentId && this.plugin.leafSync.isLive(n.id)
-		)) {
+		if (tabs.length === 1) {
+			const node = tabs[0];
 			menu.addItem((item) =>
-				item.setTitle(`Move to: ${group.title}`).setIcon('folder').onClick(() => {
-					void this.plugin.leafSync.moveTab(node, group.id, this.store.children(group.id).length);
+				item.setTitle('Rename').setIcon('pencil').onClick(() => {
+					const titleEl = this.treeEl.querySelector<HTMLElement>(`[data-node-id="${node.id}"] .working-tabs-title`);
+					if (titleEl) this.startRename(titleEl, node);
 				})
 			);
+			menu.addItem((item) =>
+				item
+					.setTitle(node.done ? 'Mark not done' : 'Mark done')
+					.setIcon('check')
+					.onClick(() => void this.store.toggleDone(node.id))
+			);
+			menu.addSeparator();
 		}
-		menu.addSeparator();
-		menu.addItem((item) =>
-			item.setTitle('Close tab').setIcon('x').onClick(() => void this.plugin.leafSync.closeTab(node))
-		);
+		addSendItems(menu, this.plugin, tabs, { dockGroup: true, dockTab: true });
+		if (tabs.length === 1) {
+			menu.addSeparator();
+			menu.addItem((item) =>
+				item.setTitle('Close tab').setIcon('x').onClick(() => void this.plugin.leafSync.closeTab(tabs[0]))
+			);
+		}
 		menu.showAtMouseEvent(evt);
 	}
 
@@ -937,7 +1045,7 @@ export class TabSpacesView extends ItemView {
 		if (parentId === null) return dragged.type === 'group' || dragged.type === 'section';
 		if (parentId === COMPLETED_PARENT_ID) return dragged.type === 'group';
 		const parent = this.store.find(parentId);
-		if (parent?.type === 'section') return dragged.type === 'group';
+		if (parent?.type === 'section') return dragged.type === 'group' || dragged.type === 'tab';
 		if (parent?.type === 'group') return dragged.type === 'tab';
 		return false;
 	}
@@ -950,9 +1058,7 @@ export class TabSpacesView extends ItemView {
 			evt.dataTransfer!.effectAllowed = 'move';
 		});
 		row.addEventListener('dragend', () => {
-			row.removeClass('working-tabs-dragging');
-			this.clearDropMarker();
-			this.draggedId = null;
+			this.finishDrag(row);
 		});
 
 		row.addEventListener('dragover', (evt) => {
@@ -979,6 +1085,9 @@ export class TabSpacesView extends ItemView {
 
 	/** Returns null when this drop wouldn't be valid, so callers can skip preventDefault/marking entirely. */
 	private computeDropPosition(row: HTMLElement, target: SpaceNode, dragged: SpaceNode, evt: DragEvent): DropPosition | null {
+		if (dragged.type === 'tab' && (target.type === 'group' || target.type === 'section')) {
+			return this.canDropAt(dragged, target.id) ? 'into' : null;
+		}
 		const rect = row.getBoundingClientRect();
 		const fraction = (evt.clientY - rect.top) / rect.height;
 		const canNestInto = (target.type === 'group' || target.type === 'section') && this.canDropAt(dragged, target.id);
@@ -1001,17 +1110,25 @@ export class TabSpacesView extends ItemView {
 
 	private async handleDrop(dragged: SpaceNode, target: SpaceNode, position: DropPosition): Promise<void> {
 		if (dragged.type === 'tab') {
-			if (position === 'into' && target.type === 'group') {
-				const index = this.store.children(target.id).filter((n) => n.id !== dragged.id).length;
-				await this.plugin.leafSync.moveTab(dragged, target.id, index);
+			if (position === 'into' && target.type === 'section') {
+				await this.plugin.leafSync.sendToPool([dragged], target.id);
 				return;
 			}
-			if (!target.parentId) return;
+			if (position === 'into' && target.type === 'group') {
+				await this.plugin.leafSync.sendToGroup([dragged], target.id);
+				return;
+			}
+			if (target.type !== 'tab' || !target.parentId) return;
+			const parent = this.store.find(target.parentId);
 			const siblings = this.store.children(target.parentId).filter((n) => n.id !== dragged.id);
 			let index = siblings.findIndex((n) => n.id === target.id);
 			if (index === -1) index = siblings.length;
 			if (position === 'after') index += 1;
-			await this.plugin.leafSync.moveTab(dragged, target.parentId, index);
+			if (parent?.type === 'section') {
+				await this.store.moveInto(dragged.id, parent.id, index);
+				return;
+			}
+			if (parent?.type === 'group') await this.plugin.leafSync.sendToGroup([dragged], parent.id, index);
 			return;
 		}
 
@@ -1025,6 +1142,113 @@ export class TabSpacesView extends ItemView {
 		if (index === -1) index = siblings.length;
 		if (position === 'after') index += 1;
 		await this.store.moveInto(dragged.id, target.parentId, index);
+	}
+
+	private registerViewportDrop(): void {
+		const over = (evt: DragEvent) => this.onViewportDragOver(evt);
+		const drop = (evt: DragEvent) => void this.onViewportDrop(evt);
+		const end = () => this.finishDrag();
+		const root = this.app.workspace.containerEl;
+		root.addEventListener('dragover', over);
+		root.addEventListener('drop', drop);
+		document.addEventListener('dragend', end);
+		this.register(() => {
+			root.removeEventListener('dragover', over);
+			root.removeEventListener('drop', drop);
+			document.removeEventListener('dragend', end);
+			this.clearViewportDrop();
+		});
+	}
+
+	private finishDrag(row?: HTMLElement): void {
+		row?.removeClass('working-tabs-dragging');
+		this.clearDropMarker();
+		this.clearViewportDrop();
+		this.draggedId = null;
+		if (!this.renderAfterDrag) return;
+		this.renderAfterDrag = false;
+		this.render();
+	}
+
+	private draggedGroup(): SpaceNode | undefined {
+		const node = this.draggedId ? this.store.find(this.draggedId) : undefined;
+		if (!node || node.type !== 'group' || node.parentId === COMPLETED_PARENT_ID) return undefined;
+		return node;
+	}
+
+	private viewportTarget(evt: DragEvent): { el: HTMLElement; zone: 'left' | 'right' | 'top' | 'bottom' | 'center' } | null {
+		const target = evt.target;
+		if (!(target instanceof Element)) return null;
+		if (target.closest('.mod-left-split, .mod-right-split, .working-tabs-view')) return null;
+		const el = target.closest('.mod-root .workspace-leaf');
+		if (!(el instanceof HTMLElement)) return null;
+		const rect = el.getBoundingClientRect();
+		if (rect.width < 8 || rect.height < 8) return null;
+		const x = (evt.clientX - rect.left) / rect.width;
+		const y = (evt.clientY - rect.top) / rect.height;
+		const edge = 0.28;
+		let zone: 'left' | 'right' | 'top' | 'bottom' | 'center' = 'center';
+		if (y < edge) zone = 'top';
+		else if (y > 1 - edge) zone = 'bottom';
+		else if (x < edge) zone = 'left';
+		else if (x > 1 - edge) zone = 'right';
+		return { el, zone };
+	}
+
+	private onViewportDragOver(evt: DragEvent): void {
+		if (!this.draggedGroup()) {
+			this.clearViewportDrop();
+			return;
+		}
+		const hit = this.viewportTarget(evt);
+		if (!hit) {
+			this.clearViewportDrop();
+			return;
+		}
+		evt.preventDefault();
+		if (evt.dataTransfer) evt.dataTransfer.dropEffect = 'move';
+		this.markViewportDrop(hit.el, hit.zone);
+	}
+
+	private async onViewportDrop(evt: DragEvent): Promise<void> {
+		const group = this.draggedGroup();
+		const hit = group ? this.viewportTarget(evt) : null;
+		this.clearViewportDrop();
+		if (!group || !hit) return;
+		evt.preventDefault();
+		evt.stopPropagation();
+		const anchor = this.leafForElement(hit.el);
+		if (!anchor) return;
+		await this.plugin.leafSync.placeGroupBeside(group.id, anchor, hit.zone);
+	}
+
+	private markViewportDrop(el: HTMLElement, zone: string): void {
+		if (this.viewportDropEl === el && this.viewportDropZone === zone) return;
+		if (this.viewportDropEl && this.viewportDropEl !== el) this.clearViewportDrop();
+		this.viewportDropEl = el;
+		this.viewportDropZone = zone;
+		el.addClass('working-tabs-viewport-drop');
+		for (const name of ['left', 'right', 'top', 'bottom', 'center']) {
+			el.toggleClass(`is-${name}`, name === zone);
+		}
+	}
+
+	private clearViewportDrop(): void {
+		const el = this.viewportDropEl;
+		this.viewportDropZone = null;
+		if (!el) return;
+		el.removeClass('working-tabs-viewport-drop', 'is-left', 'is-right', 'is-top', 'is-bottom', 'is-center');
+		this.viewportDropEl = null;
+	}
+
+	private leafForElement(el: HTMLElement): WorkspaceLeaf | null {
+		let found: WorkspaceLeaf | null = null;
+		this.app.workspace.iterateAllLeaves((leaf) => {
+			if (found) return;
+			const leafEl = leaf.view.containerEl.closest('.workspace-leaf');
+			if (leafEl === el) found = leaf;
+		});
+		return found;
 	}
 
 	private registerRootDropZone(treeEl: HTMLElement): void {

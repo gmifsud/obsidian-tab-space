@@ -6,9 +6,10 @@
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "deploy": "node scripts/deploy.mjs --config working-tabs-deploy.local.json",
     "dist": "npm run build && node scripts/package-dist.mjs",
     "lint": "eslint src/",
-    "test": "vitest run src"
+    "test": "vitest run src tests"
   },
   "keywords": [],
   "author": "notenerd",

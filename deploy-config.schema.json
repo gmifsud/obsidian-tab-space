@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/NoteNerdOfficial/working-tabs/schemas/deploy-config.schema.json",
+  "title": "Working tabs deployment configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "vaults",
+    "backup"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "backup": {
+      "type": "boolean",
+      "default": true
+    },
+    "vaults": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "path",
+          "enabled"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}

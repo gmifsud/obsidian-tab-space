@@ -98,6 +98,53 @@ npm run dev    # watch mode with source maps
 npm run build  # production bundle
 ```
 
+## Deploy from source
+
+Copy the example deployment config to an ignored local file:
+
+```bash
+cp working-tabs-deploy.example.json working-tabs-deploy.local.json
+```
+
+On Windows PowerShell, use:
+
+```powershell
+Copy-Item .\working-tabs-deploy.example.json .\working-tabs-deploy.local.json
+```
+
+Edit `working-tabs-deploy.local.json` and set each vault's `path` and `enabled` value:
+
+```json
+{
+  "$schema": "./deploy-config.schema.json",
+  "backup": true,
+  "vaults": [
+    {
+      "name": "Primary",
+      "path": "D:/Vaults/Primary",
+      "enabled": true
+    }
+  ]
+}
+```
+
+Forward slashes are recommended in Windows JSON paths. If you use backslashes, JSON requires each one to be doubled, for example `D:\\Vaults\\Primary`.
+
+`npm run deploy` passes `working-tabs-deploy.local.json` for you. Preview the deployment first, then run it:
+
+```bash
+npm run deploy -- --dry-run
+npm run deploy
+```
+
+An extra `--vault` is added on top of that file. To deploy a path and skip the local file, call the script directly:
+
+```bash
+node scripts/deploy.mjs --vault "D:/Vaults/Primary" --vault "D:/Vaults/Test"
+```
+
+The deployer builds once, validates every vault before writing, and copies only `main.js`, `manifest.json`, and `styles.css` into `.obsidian/plugins/working-tabs/`. It skips unchanged files, preserves `data.json` and unrelated files, creates backups for changed release files, and rolls back completed writes if a multi-vault deployment fails. Every path must point to an existing Obsidian vault containing `.obsidian`; symbolic links, duplicate destinations, and paths overlapping the source repository are rejected.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).

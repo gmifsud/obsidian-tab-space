@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Working tabs — wireframe</title>
+<style>
+  :root {
+    --bg: #1e1e1e;
+    --sidebar: #1b1b1b;
+    --pane: #262626;
+    --line: #333;
+    --text: #d4d4d4;
+    --muted: #8a8a8a;
+    --faint: #6a6a6a;
+    --hover: #2a2a2a;
+    --menu: #252525;
+    --accent: #e08b3c;
+    --select: rgba(224, 139, 60, 0.18);
+    --pool: #7eb6d6;
+    --font: "Segoe UI", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #111; color: var(--text); font: 13px/1.4 var(--font); }
+  body { display: flex; flex-direction: column; min-height: 100%; }
+  .brief {
+    padding: 14px 22px 10px;
+    color: #c8c8c8;
+    max-width: 1100px;
+  }
+  .brief h1 { font: 600 15px/1.3 var(--font); margin: 0 0 4px; letter-spacing: 0; }
+  .brief p { margin: 0; color: var(--muted); max-width: 78ch; }
+  .stage { flex: 1; display: flex; justify-content: center; align-items: stretch; padding: 8px 22px 18px; }
+  .window {
+    width: min(1100px, 100%);
+    height: min(720px, calc(100vh - 110px));
+    min-height: 520px;
+    background: var(--bg);
+    border: 1px solid #3a3a3a;
+    display: grid;
+    grid-template-columns: 252px 1fr;
+    grid-template-rows: 1fr 28px;
+  }
+  aside { background: var(--sidebar); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+  .search {
+    margin: 10px 10px 6px;
+    background: #161616;
+    border: 1px solid #2e2e2e;
+    color: var(--muted);
+    padding: 5px 8px;
+    font: inherit;
+  }
+  .tree { overflow: auto; padding: 4px 0 16px; }
+  .sec-label {
+    display: flex; align-items: center; gap: 6px;
+    padding: 10px 12px 4px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .sec-label .count { margin-left: auto; color: var(--faint); }
+  .row {
+    display: flex; align-items: center; gap: 6px;
+    padding: 3px 10px 3px 8px;
+    min-height: 26px;
+    cursor: default;
+    position: relative;
+  }
+  .row:hover { background: var(--hover); }
+  .row.selected { background: #2c2c2c; outline: 1px solid #3d3d3d; outline-offset: -1px; }
+  .row .bar { width: 3px; align-self: stretch; border-radius: 1px; flex: none; }
+  .row .name { display: flex; flex-direction: column; min-width: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .meta { margin-left: auto; color: var(--faint); font-size: 11px; flex: none; }
+  .chev { width: 14px; color: var(--faint); flex: none; text-align: center; }
+  .pool {
+    margin: 2px 8px 6px 22px;
+    border: 1px dashed #3a4a55;
+    background: rgba(126, 182, 214, 0.04);
+  }
+  .pool .cap {
+    padding: 4px 8px 2px;
+    color: var(--pool);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .pool .empty { padding: 4px 8px 8px; color: var(--faint); font-size: 12px; }
+  .pool .row { padding-left: 8px; }
+  .home-hint { display: block; color: var(--faint); font-size: 11px; }
+  .mark { color: var(--pool); font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; }
+  main { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: #141414; }
+  .workspace {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 28% 1fr 28%;
+    grid-template-rows: 26% 1fr 26%;
+    gap: 6px;
+    padding: 8px;
+  }
+  .cell { min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 6px; }
+  .cell[data-edge="top"] { grid-column: 1 / -1; grid-row: 1; }
+  .cell[data-edge="left"] { grid-column: 1; grid-row: 2; }
+  .cell[data-edge="main"] { grid-column: 2; grid-row: 2; }
+  .cell[data-edge="right"] { grid-column: 3; grid-row: 2; }
+  .cell[data-edge="bottom"] { grid-column: 1 / -1; grid-row: 3; }
+  .cell:empty { outline: 1px dashed #2a2a2a; }
+  .frame {
+    background: var(--pane);
+    border: 1px solid #3a3a3a;
+    min-height: 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+  }
+  .frame.docked { border-color: #6a4a28; }
+  .tabbar {
+    display: flex;
+    align-items: stretch;
+    background: #1c1c1c;
+    border-bottom: 1px solid #333;
+    min-height: 32px;
+  }
+  .tabs { display: flex; flex: 1; min-width: 0; overflow: hidden; }
+  .chip {
+    display: flex; align-items: center; gap: 6px;
+    padding: 0 10px;
+    max-width: 180px;
+    border-right: 1px solid #2a2a2a;
+    color: #bdbdbd;
+    cursor: default;
+    position: relative;
+  }
+  .chip .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip.active { color: #fff; background: #2a2a2a; }
+  .chip.active::after {
+    content: "";
+    position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+    background: var(--accent);
+  }
+  .chip.picked { box-shadow: inset 0 0 0 1px var(--accent); }
+  .stack-btn, .more {
+    width: 28px; flex: none;
+    display: grid; place-items: center;
+    color: var(--muted);
+    border-left: 1px solid #2a2a2a;
+    cursor: default;
+  }
+  .stack-btn:hover, .more:hover, .chip:hover { background: #2e2e2e; }
+  .doc {
+    padding: 18px 22px;
+    overflow: auto;
+    color: #c6c6c6;
+  }
+  .doc h2 { font: 600 18px/1.3 var(--font); margin: 0 0 8px; color: #e8e8e8; }
+  .doc p { margin: 0; color: var(--muted); }
+  .status {
+    grid-column: 1 / -1;
+    border-top: 1px solid var(--line);
+    display: flex; align-items: center;
+    padding: 0 12px;
+    color: #c2c2c2;
+    background: #181818;
+    font-size: 12px;
+  }
+  .menu {
+    position: fixed;
+    z-index: 20;
+    min-width: 220px;
+    background: var(--menu);
+    border: 1px solid #3f3f3f;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+    padding: 4px 0;
+  }
+  .menu.hidden { display: none; }
+  .mi {
+    padding: 4px 12px 4px 10px;
+    display: flex; align-items: center; gap: 8px;
+    position: relative;
+    white-space: nowrap;
+  }
+  .mi:hover, .mi.open { background: #333; }
+  .mi.dim { color: #6e6e6e; }
+  .mi .k { margin-left: auto; color: var(--faint); font-size: 11px; padding-left: 16px; }
+  .sep { height: 1px; background: #3a3a3a; margin: 4px 0; }
+  .sub {
+    display: none;
+    position: absolute;
+    left: 100%;
+    top: -5px;
+    min-width: 200px;
+    background: var(--menu);
+    border: 1px solid #3f3f3f;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+    padding: 4px 0;
+  }
+  .mi.open > .sub, .mi:hover > .sub { display: block; }
+  .hint { padding: 2px 12px 6px; color: var(--faint); font-size: 11px; }
+</style>
+</head>
+<body>
+  <div class="brief">
+    <h1>Working tabs wireframe</h1>
+    <p>Click only selects. The tab stack docks the whole pane. A tab’s own menu sends that tab into a pool or another group. Ctrl-click several tabs, then right-click, to send them together. Right-click a sidebar row for the same send commands.</p>
+  </div>
+  <div class="stage">
+    <div class="window">
+      <aside>
+        <input class="search" value="" placeholder="Search tabs and groups…" disabled />
+        <div class="tree" id="tree"></div>
+      </aside>
+      <main>
+        <div class="workspace" id="workspace"></div>
+      </main>
+      <div class="status" id="status">Click a tab to select it. The pane stays where it is.</div>
+    </div>
+  </div>
+  <div id="menu" class="menu hidden"></div>
+<script>
+const sections = [
+  { id: "nav", title: "Navigation", color: "#d45d97" },
+  { id: "work", title: "Work", color: "#e08b3c" },
+];
+
+let groups = [
+  { id: "sast", title: "SAST", sectionId: "nav", color: "#d45d97" },
+  { id: "main", title: "Main", sectionId: "nav", color: "#8b6fd6" },
+  { id: "home", title: "Home", sectionId: "nav", color: "#43a047" },
+  { id: "qisl", title: "QISL Platform", sectionId: "work", color: "#e08b3c", dock: "main" },
+  { id: "harness", title: "Tool Harness", sectionId: "work", color: "#2fa3a3" },
+  { id: "sfa", title: "SFA", sectionId: "work", color: "#4a7fe0" },
+  { id: "pay", title: "Payment Gateway", sectionId: "work", color: "#d0a215" },
+  { id: "ext", title: "External Services", sectionId: "work", color: "#d1453b" },
+];
+
+let tabs = [
+  { id: "a", title: "Architecture and Design of a Decoupled…", groupId: "qisl", order: 0 },
+  { id: "b", title: "Session Recovery — Backend Gr…", groupId: "qisl", order: 1 },
+  { id: "c", title: "Belial Dreams", groupId: "qisl", order: 2 },
+  { id: "d", title: "Terminus 1", groupId: "qisl", order: 3 },
+  { id: "e", title: "QISL Platform", groupId: "qisl", order: 4 },
+  { id: "f", title: "Payment notes", groupId: "ext", order: 0 },
+  { id: "g", title: "Theme registry", groupId: "harness", order: 0 },
+];
+
+let activeId = "e";
+let selected = new Set(["e"]);
+let sideSelected = null;
+let seq = 1;
+
+const tree = document.getElementById("tree");
+const workspace = document.getElementById("workspace");
+const status = document.getElementById("status");
+const menu = document.getElementById("menu");
+
+function groupById(id) { return groups.find((g) => g.id === id); }
+function sectionById(id) { return sections.find((s) => s.id === id); }
+function tabById(id) { return tabs.find((t) => t.id === id); }
+
+function say(text) { status.textContent = text; }
+
+function tabsInGroup(groupId) {
+  return tabs
+    .filter((t) => t.groupId === groupId && !t.poolSectionId)
+    .sort((a, b) => a.order - b.order);
+}
+
+/** Open leaves stay in the pane even after the sidebar row is filed in a pool. */
+function tabsOnPane(groupId) {
+  return tabs.filter((t) => t.groupId === groupId).sort((a, b) => a.order - b.order);
+}
+
+function poolTabs(sectionId) {
+  return tabs.filter((t) => t.poolSectionId === sectionId);
+}
+
+function visibleGroups() {
+  return groups.filter((g) => g.dock);
+}
+
+function render() {
+  renderTree();
+  renderWorkspace();
+}
+
+function renderTree() {
+  tree.replaceChildren();
+  for (const section of sections) {
+    const label = el("div", "sec-label");
+    label.append(el("span", "chev", "›"), document.createTextNode(section.title));
+    const owned = groups.filter((g) => g.sectionId === section.id).length;
+    label.append(el("span", "count", String(owned)));
+    tree.append(label);
+
+    const tray = el("div", "pool");
+    tray.dataset.sectionId = section.id;
+    tray.addEventListener("dragover", (evt) => evt.preventDefault());
+    tray.addEventListener("drop", (evt) => {
+      evt.preventDefault();
+      const ids = takeDrag(evt);
+      if (ids.length) sendToPool(ids, section.id);
+    });
+    tray.append(el("div", "cap", section.title + " pool"));
+    const parked = poolTabs(section.id);
+    if (parked.length === 0) tray.append(el("div", "empty", "Drop or send tabs here. They stay open."));
+    for (const tab of parked) {
+      const home = groupById(tab.origin?.groupId ?? tab.groupId);
+      const row = tabRow(tab, home ? "returns to " + home.title : "");
+      tray.append(row);
+    }
+    tree.append(tray);
+
+    for (const group of groups.filter((g) => g.sectionId === section.id)) {
+      const kids = tabsInGroup(group.id);
+      const row = el("div", "row" + (sideSelected === group.id ? " selected" : ""));
+      const bar = el("span", "bar");
+      bar.style.background = group.color;
+      row.append(bar, el("span", "chev", "›"), el("span", "name", group.title));
+      const meta = group.dock ? "on screen" : "not on screen";
+      row.append(el("span", "meta", kids.length + " · " + meta));
+      row.addEventListener("click", () => {
+        sideSelected = group.id;
+        say("Selected the " + group.title + " group. The pane stayed where it is.");
+        render();
+      });
+      row.addEventListener("contextmenu", (evt) => openMenu(evt, groupMenu(group)));
+      row.addEventListener("dragover", (evt) => evt.preventDefault());
+      row.addEventListener("drop", (evt) => {
+        evt.preventDefault();
+        evt.stopPropagation();
+        const ids = takeDrag(evt);
+        if (ids.length) sendToGroup(ids, group.id);
+      });
+      tree.append(row);
+      for (const tab of kids) tree.append(tabRow(tab, ""));
+    }
+  }
+}
+
+function tabRow(tab, hint) {
+  const row = el("div", "row" + (sideSelected === tab.id ? " selected" : ""));
+  row.style.paddingLeft = "28px";
+  const name = el("span", "name");
+  name.textContent = tab.title;
+  if (hint) name.append(el("span", "home-hint", hint));
+  row.append(el("span", "chev", "·"), name);
+  if (tab.poolSectionId) row.append(el("span", "mark", "pool"));
+  row.addEventListener("click", () => {
+    sideSelected = tab.id;
+    say("Selected “" + tab.title + "”. Nothing opened and nothing moved.");
+    render();
+  });
+  row.addEventListener("contextmenu", (evt) => {
+    sideSelected = tab.id;
+    openMenu(evt, tabMenu([tab.id], "sidebar"));
+    render();
+  });
+  row.draggable = true;
+  row.addEventListener("dragstart", (evt) => setDrag(evt, tab.id));
+  return row;
+}
+
+function renderWorkspace() {
+  workspace.replaceChildren();
+  for (const edge of ["top", "left", "main", "right", "bottom"]) {
+    const cell = el("div", "cell");
+    cell.dataset.edge = edge;
+    for (const group of visibleGroups().filter((g) => (g.dock || "main") === edge)) {
+      cell.append(frameFor(group));
+    }
+    workspace.append(cell);
+  }
+}
+
+function frameFor(group) {
+  const frame = el("div", "frame" + (group.dock && group.dock !== "main" ? " docked" : ""));
+  const bar = el("div", "tabbar");
+  const strip = el("div", "tabs");
+  for (const tab of tabsOnPane(group.id)) {
+    const chip = el("div", "chip" + (tab.id === activeId ? " active" : "") + (selected.has(tab.id) ? " picked" : ""));
+    const label = el("span", "label", tab.title);
+    chip.append(label);
+    if (tab.poolSectionId) chip.append(el("span", "mark", "pool"));
+    chip.draggable = true;
+    chip.addEventListener("dragstart", (evt) => setDrag(evt, tab.id));
+    chip.addEventListener("click", (evt) => {
+      if (evt.ctrlKey || evt.metaKey) {
+        if (selected.has(tab.id)) selected.delete(tab.id);
+        else selected.add(tab.id);
+        say(selected.size + " tabs selected. Right-click to send them. The pane stayed put.");
+      } else {
+        selected = new Set([tab.id]);
+        activeId = tab.id;
+        say("Showing “" + tab.title + "” in the pane already on screen.");
+      }
+      render();
+    });
+    chip.addEventListener("contextmenu", (evt) => {
+      const ids = selected.has(tab.id) && selected.size > 1 ? [...selected] : [tab.id];
+      if (ids.length === 1) {
+        selected = new Set([tab.id]);
+        activeId = tab.id;
+      }
+      openMenu(evt, tabMenu(ids, "tab"));
+      render();
+    });
+    strip.append(chip);
+  }
+  const stack = el("div", "stack-btn", "▾");
+  stack.title = "Tab stack";
+  stack.addEventListener("click", (evt) => openMenu(evt, stackMenu(group)));
+  stack.addEventListener("contextmenu", (evt) => openMenu(evt, stackMenu(group)));
+  bar.append(strip, stack);
+  const doc = el("div", "doc");
+  const shown = tabById(activeId);
+  const inThis = shown && shown.groupId === group.id;
+  doc.append(el("h2", "", inThis ? shown.title : group.title));
+  doc.append(el("p", "", inThis
+    ? (shown.poolSectionId
+      ? "Still open in this pane. The sidebar row sits in the " + sectionById(shown.poolSectionId).title + " pool."
+      : "This note is already in this pane. Selecting it here does not create a split.")
+    : "This pane belongs to " + group.title + "."));
+  frame.append(bar, doc);
+  return frame;
+}
+
+function groupMenu(group) {
+  return {
+    title: group.title,
+    items: [
+      { label: "Dock group", hint: "whole pane", children: dockItems((edge) => dockGroup(group.id, edge)) },
+      { sep: true },
+      { label: "Obsidian: Close all", dim: true, run: () => say("Left as Obsidian’s own Close all.") },
+    ],
+  };
+}
+
+function stackMenu(group) {
+  const items = tabsOnPane(group.id).map((tab) => ({
+    label: tab.title,
+    run: () => {
+      selected = new Set([tab.id]);
+      activeId = tab.id;
+      say("Picked “" + tab.title + "” from the stack. The pane stayed put.");
+      render();
+    },
+  }));
+  items.push({ sep: true });
+  items.push({ label: "Dock group", hint: "whole pane", children: dockItems((edge) => dockGroup(group.id, edge)) });
+  items.push({
+    label: "Send every tab to pool",
+    hint: "leaves stay",
+      children: sections.map((section) => ({
+      label: section.title,
+      run: () => sendToPool(tabsOnPane(group.id).map((t) => t.id), section.id),
+    })),
+  });
+  return { title: "Stack · " + group.title, hint: "Dock moves every tab in this pane together.", items };
+}
+
+function tabMenu(ids, source) {
+  const many = ids.length > 1;
+  const first = tabById(ids[0]);
+  const items = [];
+  if (source === "tab") {
+    items.push({ label: many ? "Obsidian: Close selected" : "Obsidian: Close", dim: true, run: () => say("Left as Obsidian’s own command.") });
+    items.push({ label: many ? "Obsidian: Pin selected" : "Obsidian: Pin", dim: true, run: () => say("Left as Obsidian’s own command.") });
+    items.push({ sep: true });
+  }
+  items.push({
+    label: many ? "Send " + ids.length + " tabs to pool" : "Send to pool",
+    hint: "leaf stays",
+    children: sections.map((section) => ({
+      label: section.title,
+      run: () => sendToPool(ids, section.id),
+    })),
+  });
+  items.push({
+    label: many ? "Send " + ids.length + " tabs to group" : "Send to group",
+    hint: "no reveal",
+    children: groups.filter((g) => !g.peeled).map((group) => ({
+      label: group.title,
+      dim: ids.every((id) => tabById(id).groupId === group.id && !tabById(id).poolSectionId),
+      run: () => sendToGroup(ids, group.id),
+    })),
+  });
+  const returnable = ids.filter((id) => tabById(id).origin);
+  if (returnable.length) {
+    items.push({
+      label: returnable.length > 1 ? "Return each to its own group" : "Return to " + (groupById(tabById(returnable[0]).origin.groupId)?.title ?? "origin"),
+      run: () => restore(returnable),
+    });
+  }
+  items.push({ sep: true });
+  items.push({
+    label: many ? "Dock selected together" : "Dock this tab",
+    hint: "one pane",
+    children: dockItems((edge) => peel(ids, edge)),
+  });
+  return { title: many ? ids.length + " tabs" : first.title, hint: source === "sidebar" ? "Same commands as the tab header." : "", items };
+}
+
+function dockItems(run) {
+  return [
+    ["Dock left", "left"],
+    ["Dock right", "right"],
+    ["Dock top", "top"],
+    ["Dock bottom", "bottom"],
+  ].map(([label, edge]) => ({ label, run: () => run(edge) }));
+}
+
+function sendToPool(ids, sectionId) {
+  const section = sectionById(sectionId);
+  for (const id of ids) {
+    const tab = tabById(id);
+    if (!tab.origin) tab.origin = { groupId: tab.groupId, order: tab.order };
+    tab.poolSectionId = sectionId;
+  }
+  selected = new Set(ids);
+  say("Filed " + ids.length + " tab" + (ids.length > 1 ? "s" : "") + " in the " + section.title + " pool. " + (ids.length > 1 ? "They remember" : "It remembers") + " where " + (ids.length > 1 ? "they" : "it") + " came from. No pane moved.");
+  closeMenu();
+  render();
+}
+
+function sendToGroup(ids, groupId) {
+  const group = groupById(groupId);
+  let order = tabsInGroup(groupId).reduce((max, tab) => Math.max(max, tab.order), -1);
+  for (const id of ids) {
+    const tab = tabById(id);
+    if (tab.groupId === groupId && !tab.poolSectionId) continue;
+    tab.poolSectionId = null;
+    tab.origin = null;
+    tab.groupId = groupId;
+    tab.order = ++order;
+  }
+  say("Sent " + ids.length + " tab" + (ids.length > 1 ? "s" : "") + " to " + group.title + ". " + (group.dock ? "That pane is on screen." : "That pane stayed off screen, and this view did not jump to it.") + " This is their new home.");
+  closeMenu();
+  render();
+}
+
+function restore(ids) {
+  for (const id of ids) {
+    const tab = tabById(id);
+    if (!tab.origin) continue;
+    tab.groupId = tab.origin.groupId;
+    tab.order = tab.origin.order;
+    tab.poolSectionId = null;
+    tab.origin = null;
+  }
+  say("Put back in the group " + (ids.length > 1 ? "each tab" : "it") + " left. The view did not jump.");
+  closeMenu();
+  render();
+}
+
+function dockGroup(groupId, edge) {
+  const group = groupById(groupId);
+  group.dock = edge;
+  say("Docked the " + group.title + " pane to the " + edge + ". Every tab in that pane moved together.");
+  closeMenu();
+  render();
+}
+
+function peel(ids, edge) {
+  const id = "peel" + seq++;
+  const title = ids.length === 1 ? tabById(ids[0]).title : ids.length + " tabs";
+  groups.push({ id, title, sectionId: "work", color: "#7eb6d6", dock: edge, peeled: true });
+  let order = 0;
+  for (const tabId of ids) {
+    const tab = tabById(tabId);
+    tab.poolSectionId = null;
+    tab.origin = null;
+    tab.groupId = id;
+    tab.order = order++;
+  }
+  say("Peeled " + ids.length + " tab" + (ids.length > 1 ? "s" : "") + " into " + (ids.length > 1 ? "their" : "its") + " own pane on the " + edge + ". The rest of the group stayed.");
+  closeMenu();
+  render();
+}
+
+function openMenu(evt, spec) {
+  evt.preventDefault();
+  evt.stopPropagation();
+  menu.replaceChildren();
+  if (spec.hint) menu.append(el("div", "hint", spec.hint));
+  for (const item of spec.items) {
+    if (item.sep) {
+      menu.append(el("div", "sep"));
+      continue;
+    }
+    const row = el("div", "mi" + (item.dim ? " dim" : ""));
+    row.append(document.createTextNode(item.label));
+    if (item.hint) row.append(el("span", "k", item.hint));
+    if (item.children) {
+      row.append(el("span", "k", "›"));
+      const sub = el("div", "sub");
+      for (const child of item.children) {
+        const subRow = el("div", "mi" + (child.dim ? " dim" : ""), child.label);
+        subRow.addEventListener("click", (e) => {
+          e.stopPropagation();
+          if (!child.dim) child.run();
+        });
+        sub.append(subRow);
+      }
+      row.append(sub);
+      row.addEventListener("mouseenter", () => row.classList.add("open"));
+      row.addEventListener("mouseleave", () => row.classList.remove("open"));
+    } else {
+      row.addEventListener("click", (e) => {
+        e.stopPropagation();
+        item.run();
+      });
+    }
+    menu.append(row);
+  }
+  menu.classList.remove("hidden");
+  const pad = 8;
+  const rect = menu.getBoundingClientRect();
+  let x = evt.clientX;
+  let y = evt.clientY;
+  if (x + rect.width > window.innerWidth - pad) x = window.innerWidth - rect.width - pad;
+  if (y + rect.height > window.innerHeight - pad) y = window.innerHeight - rect.height - pad;
+  menu.style.left = x + "px";
+  menu.style.top = y + "px";
+}
+
+function closeMenu() { menu.classList.add("hidden"); }
+
+function setDrag(evt, id) {
+  const ids = selected.has(id) && selected.size > 1 ? [...selected] : [id];
+  evt.dataTransfer.setData("text/plain", ids.join(","));
+  evt.dataTransfer.effectAllowed = "move";
+}
+
+function takeDrag(evt) {
+  return (evt.dataTransfer.getData("text/plain") || "").split(",").filter((id) => tabById(id));
+}
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = text;
+  return node;
+}
+
+document.addEventListener("click", (evt) => {
+  if (!menu.contains(evt.target)) closeMenu();
+});
+document.addEventListener("keydown", (evt) => {
+  if (evt.key === "Escape") closeMenu();
+});
+
+render();
+</script>
+</body>
+</html>

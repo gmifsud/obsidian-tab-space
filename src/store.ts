@@ -19,6 +19,39 @@ import {
  * migrate anything still pointing at it from before the change. */
 const LEGACY_UNSORTED_PARENT_ID = '__unsorted__';
 
+/** Hue each named slot stands in for, so an automatic colour is not placed on top of a picked one. */
+const SLOT_HUE: Record<ColorSlot, number> = {
+	blue: 214,
+	purple: 270,
+	green: 130,
+	orange: 28,
+	cyan: 185,
+	pink: 330,
+	yellow: 48,
+	red: 4,
+};
+
+function hueDistance(a: number, b: number): number {
+	const d = Math.abs(a - b) % 360;
+	return Math.min(d, 360 - d);
+}
+
+/** Hue farthest from every hue already in use. Empty set starts at blue. */
+function farthestHue(taken: number[]): number {
+	if (taken.length === 0) return 214;
+	let best = 0;
+	let bestDist = -1;
+	for (let hue = 0; hue < 360; hue++) {
+		let nearest = 360;
+		for (const used of taken) nearest = Math.min(nearest, hueDistance(hue, used));
+		if (nearest > bestDist) {
+			bestDist = nearest;
+			best = hue;
+		}
+	}
+	return best;
+}
+
 export class TabSpacesStore {
 	private plugin: TabSpacesPlugin;
 	private data: TabSpacesData;
@@ -50,6 +83,7 @@ export class TabSpacesStore {
 				item.autoColor = this.pickAutoColor();
 			}
 		}
+		if (this.assignDistinctHues()) await this.save();
 	}
 
 	/**
@@ -102,6 +136,65 @@ export class TabSpacesStore {
 		// uncoloured with it -- no separate rule needed for the section case.
 		if (parent?.type === 'section') return this.effectiveColor(parent);
 		return node.autoColor;
+	}
+
+	/** CSS colour for a group, or for a tab the group it sits in. Automatic
+	 * colours are unique hues. A section does not paint its groups one colour. */
+	accentCss(node: SpaceNode): string | undefined {
+		if (!this.data.settings.colorCoding) return undefined;
+		const group = this.colorGroup(node);
+		if (!group || group.color === 'none') return undefined;
+		if (group.color) return `var(--working-tabs-color-${group.color})`;
+		if (group.autoHue == null) return undefined;
+		return `hsl(${group.autoHue} 64% 58%)`;
+	}
+
+	private colorGroup(node: SpaceNode): SpaceNode | undefined {
+		if (node.type === 'group') return node;
+		if (node.type !== 'tab' || !node.parentId) return undefined;
+		const parent = this.find(node.parentId);
+		return parent?.type === 'group' ? parent : undefined;
+	}
+
+	/** Gives every automatic group a hue that is not already taken. Explicit
+	 * colour picks are left as the user set them and are treated as occupied. */
+	private assignDistinctHues(): boolean {
+		const taken: number[] = [];
+		for (const node of this.data.items) {
+			if (node.type !== 'group' || !node.color || node.color === 'none') continue;
+			taken.push(SLOT_HUE[node.color]);
+		}
+		const autos = this.data.items
+			.filter((node) => node.type === 'group' && !node.color)
+			.sort((a, b) => a.id.localeCompare(b.id));
+		let changed = false;
+		for (const group of autos) {
+			const hue = group.autoHue;
+			const clash =
+				hue == null ||
+				taken.some((used) => hueDistance(hue, used) < 8);
+			if (!clash && hue != null) {
+				taken.push(hue);
+				continue;
+			}
+			const next = farthestHue(taken);
+			if (group.autoHue !== next) {
+				group.autoHue = next;
+				changed = true;
+			}
+			taken.push(next);
+		}
+		return changed;
+	}
+
+	private nextAutoHue(): number {
+		const taken: number[] = [];
+		for (const node of this.data.items) {
+			if (node.type !== 'group') continue;
+			if (node.color && node.color !== 'none') taken.push(SLOT_HUE[node.color]);
+			else if (!node.color && node.autoHue != null) taken.push(node.autoHue);
+		}
+		return farthestHue(taken);
 	}
 
 	/** `color: undefined` is "Automatic" -- back to inheriting from the section
@@ -257,6 +350,7 @@ export class TabSpacesStore {
 			collapsed: false,
 			openBehavior: { ...openBehavior },
 			autoColor: this.pickAutoColor(),
+			autoHue: this.nextAutoHue(),
 		};
 		this.data.items.push(node);
 		await this.save();
@@ -283,6 +377,8 @@ export class TabSpacesStore {
 		title: string,
 		options: { filePath?: string; viewState?: unknown } = {}
 	): Promise<SpaceNode> {
+		const existing = this.children(groupId).find((node) => node.type === 'tab' && node.tabKey === tabKey);
+		if (existing) return existing;
 		const node: SpaceNode = {
 			id: generateId(),
 			type: 'tab',
@@ -375,12 +471,19 @@ export class TabSpacesStore {
 		this.notify();
 	}
 
+	async setCollapsed(id: string, collapsed: boolean): Promise<void> {
+		const node = this.find(id);
+		if (!node || (node.type !== 'group' && node.type !== 'section')) return;
+		if (Boolean(node.collapsed) === collapsed) return;
+		node.collapsed = collapsed;
+		await this.save();
+		this.notify();
+	}
+
 	async toggleCollapsed(id: string): Promise<void> {
 		const node = this.find(id);
 		if (!node || (node.type !== 'group' && node.type !== 'section')) return;
-		node.collapsed = !node.collapsed;
-		await this.save();
-		this.notify();
+		await this.setCollapsed(id, !node.collapsed);
 	}
 
 	/** Purely cosmetic -- never closes or removes the tab. */
@@ -417,6 +520,46 @@ export class TabSpacesStore {
 		if (node.homePaneId === paneId && !node.homeLeafId) return;
 		node.homePaneId = paneId;
 		node.homeLeafId = undefined;
+		await this.save();
+		this.notify();
+	}
+
+	/** Files a tab under a section pool. The first park remembers the group it left. */
+	async parkInPool(tabId: string, sectionId: string): Promise<void> {
+		const tab = this.find(tabId);
+		const section = this.find(sectionId);
+		if (!tab || tab.type !== 'tab' || !section || section.type !== 'section') return;
+		if (!tab.originGroupId) {
+			const parent = tab.parentId ? this.find(tab.parentId) : undefined;
+			if (parent?.type === 'group') {
+				tab.originGroupId = parent.id;
+				tab.originOrder = this.children(parent.id).findIndex((child) => child.id === tab.id);
+			}
+		}
+		const index = this.children(sectionId).filter((child) => child.id !== tab.id).length;
+		await this.moveInto(tab.id, sectionId, index);
+	}
+
+	/** Puts a pooled tab back in the group it left. The group has to still exist. */
+	async restoreOrigin(tabId: string): Promise<boolean> {
+		const tab = this.find(tabId);
+		if (!tab || tab.type !== 'tab' || !tab.originGroupId) return false;
+		const group = this.find(tab.originGroupId);
+		if (!group || group.type !== 'group') return false;
+		const index = tab.originOrder ?? this.children(group.id).length;
+		tab.originGroupId = undefined;
+		tab.originOrder = undefined;
+		await this.moveInto(tab.id, group.id, index);
+		return true;
+	}
+
+	/** Send to a named group makes that group the home, so Return no longer applies. */
+	async clearOrigin(tabId: string): Promise<void> {
+		const tab = this.find(tabId);
+		if (!tab || tab.type !== 'tab') return;
+		if (tab.originGroupId === undefined && tab.originOrder === undefined) return;
+		tab.originGroupId = undefined;
+		tab.originOrder = undefined;
 		await this.save();
 		this.notify();
 	}

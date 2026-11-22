@@ -67,6 +67,49 @@ export function effectivelyHidden(
 	return false;
 }
 
+function isSessionKey(key: string): boolean {
+	return key.includes(':') && !key.includes('/');
+}
+
+function isAutoGroupTitle(title: string): boolean {
+	return /^Group \d+$/.test(title);
+}
+
+function tabKeysOf(nodes: SpaceNode[], groupId: string): Set<string> {
+	return new Set(
+		childrenOf(nodes, groupId)
+			.filter((tab) => !tab.done && tab.tabKey)
+			.map((tab) => tab.tabKey as string)
+	);
+}
+
+/** Best dormant group whose stored files cover this pane. Session-only leaves do not block a match. */
+function bestClaim(
+	nodes: SpaceNode[],
+	paneKeys: string[],
+	candidates: SpaceNode[],
+	taken: Map<string, string>
+): { id: string; overlap: number } | undefined {
+	let best: { id: string; overlap: number } | undefined;
+	for (const group of candidates) {
+		if (taken.has(group.id)) continue;
+		const keys = tabKeysOf(nodes, group.id);
+		if (keys.size === 0) continue;
+		const fileKeys = paneKeys.filter((key) => !isSessionKey(key));
+		if (fileKeys.some((key) => !keys.has(key))) continue;
+		const overlap = paneKeys.filter((key) => keys.has(key)).length;
+		if (overlap === 0) continue;
+		if (!best || overlap > best.overlap) best = { id: group.id, overlap };
+	}
+	return best;
+}
+
+/** A tab filed in a section pool. Its leaf may still be open; the record stays put. */
+function isSectionPool(nodes: SpaceNode[], tab: SpaceNode): boolean {
+	if (tab.type !== 'tab' || !tab.parentId) return false;
+	return nodes.some((node) => node.id === tab.parentId && node.type === 'section');
+}
+
 function childrenOf(nodes: SpaceNode[], parentId: string): SpaceNode[] {
 	return nodes
 		.filter((n) => n.parentId === parentId)
@@ -109,6 +152,14 @@ export function plan(
 		}
 	}
 
+	const addedThisPass = new Set<string>();
+	const hasKey = (groupId: string, key: string): boolean => {
+		if (addedThisPass.has(`${groupId}\0${key}`)) return true;
+		return childrenOf(nodes, groupId).some((tab) => tab.type === 'tab' && tab.tabKey === key);
+	};
+	const rememberKey = (groupId: string, key: string): void => {
+		addedThisPass.add(`${groupId}\0${key}`);
+	};
 	const movedOut = new Map<string, { toGroupId: string; tabIds: string[] }>();
 	const movedTabIds = new Set<string>();
 
@@ -117,7 +168,9 @@ export function plan(
 		for (const leaf of pane.leaves) {
 			const tab = tabByKey.get(leaf.identity.key);
 			if (!tab) continue;
-			entries.push({ kind: 'syncTitle', tabId: tab.id, title: leaf.identity.title });
+			if (!tab.titleOverridden && tab.title !== leaf.identity.title) {
+				entries.push({ kind: 'syncTitle', tabId: tab.id, title: leaf.identity.title });
+			}
 			if (ctx.mode === 'full' && leaf.viewState) {
 				entries.push({ kind: 'syncViewState', tabId: tab.id, viewState: leaf.viewState });
 			}
@@ -147,24 +200,56 @@ export function plan(
 		}
 	}
 
-	// 3. Reattach (D7) — every non-done tab key present in the unclaimed pane
+	// 3. Reattach. After a restart the pane id is gone and some of the group's
+	// tabs may not have been restored yet. Claim the pane when every file in it
+	// already belongs to one dormant group. A new session-only leaf (terminal
+	// leaf ids change every launch) does not block that. Do not prune the
+	// group's other stored tabs on this pass.
 	const reattachCandidates = groups.filter(
 		(g) => !claimByGroup.has(g.id) && g.parentId !== COMPLETED_PARENT_ID
 	);
+	const freshClaims = new Set<string>();
 
 	for (const pane of snapshot.panes) {
 		if (claimByPane.has(pane.paneId)) continue;
-		const paneKeys = new Set(pane.leaves.map((l) => l.identity.key));
-		for (const g of reattachCandidates) {
-			if (claimByGroup.has(g.id)) continue;
-			const nonDone = childrenOf(nodes, g.id).filter((t) => !t.done && t.tabKey);
-			if (nonDone.length === 0) continue;
-			if (!nonDone.every((t) => paneKeys.has(t.tabKey as string))) continue;
-			entries.push({ kind: 'claimPane', groupId: g.id, paneId: pane.paneId });
-			claimByGroup.set(g.id, pane.paneId);
-			claimByPane.set(pane.paneId, g.id);
-			break;
-		}
+		const best = bestClaim(
+			nodes,
+			pane.leaves.map((leaf) => leaf.identity.key),
+			reattachCandidates,
+			claimByGroup
+		);
+		if (!best) continue;
+		entries.push({ kind: 'claimPane', groupId: best.id, paneId: pane.paneId });
+		claimByGroup.set(best.id, pane.paneId);
+		claimByPane.set(pane.paneId, best.id);
+		freshClaims.add(best.id);
+	}
+
+	// A pane already claimed by an automatic "Group N" goes back to the named
+	// group that actually owns those files. Those automatic groups are what a
+	// failed reattach left behind.
+	for (const [paneId, groupId] of [...claimByPane.entries()]) {
+		const owner = groups.find((group) => group.id === groupId);
+		if (!owner || !isAutoGroupTitle(owner.title)) continue;
+		const pane = paneById.get(paneId);
+		if (!pane) continue;
+		const paneKeys = pane.leaves.map((leaf) => leaf.identity.key);
+		const better = bestClaim(
+			nodes,
+			paneKeys,
+			groups.filter((group) => group.id !== groupId && !isAutoGroupTitle(group.title)),
+			claimByGroup
+		);
+		if (!better) continue;
+		const ownerKeys = tabKeysOf(nodes, owner.id);
+		const ownerOverlap = paneKeys.filter((key) => ownerKeys.has(key)).length;
+		if (better.overlap < ownerOverlap) continue;
+		entries.push({ kind: 'releasePane', groupId });
+		entries.push({ kind: 'claimPane', groupId: better.id, paneId });
+		claimByGroup.delete(groupId);
+		claimByGroup.set(better.id, paneId);
+		claimByPane.set(paneId, better.id);
+		freshClaims.add(better.id);
 	}
 
 	// A live group whose pane is gone, and whose non-done tabs all sit in one
@@ -218,6 +303,8 @@ export function plan(
 			const key = leaf.identity.key;
 			const existing = tabByKey.get(key);
 			if (!existing) {
+				if (hasKey(groupId, key)) continue;
+				rememberKey(groupId, key);
 				entries.push({
 					kind: 'addTab',
 					groupId,
@@ -228,6 +315,8 @@ export function plan(
 				});
 				continue;
 			}
+
+			if (isSectionPool(nodes, existing)) continue;
 
 			const fromId = effectiveParent.get(existing.id);
 			if (fromId === groupId) continue;
@@ -254,7 +343,10 @@ export function plan(
 				bucket.tabIds.push(existing.id);
 				movedOut.set(fromGroup.id, bucket);
 			} else {
-				// Dormant (or unknown) source — leave that list alone; add here.
+				// Dormant (or unknown) source — leave that list alone; add here
+				// unless this group already has the same tab.
+				if (hasKey(groupId, key)) continue;
+				rememberKey(groupId, key);
 				entries.push({
 					kind: 'addTab',
 					groupId,
@@ -274,12 +366,15 @@ export function plan(
 		const paneKeySet = new Set(paneKeys);
 
 		for (const tab of childrenOf(nodes, groupId)) {
+			if (freshClaims.has(groupId)) continue;
 			if (tab.done) continue;
 			if (effectiveParent.get(tab.id) !== groupId) continue;
 			if (movedTabIds.has(tab.id)) continue;
-			if (!tab.tabKey || !paneKeySet.has(tab.tabKey)) {
-				entries.push({ kind: 'pruneTab', tabId: tab.id });
-			}
+			if (tab.tabKey && paneKeySet.has(tab.tabKey)) continue;
+			// A note that is not open yet still belongs to the group. Dropping it
+			// here is what erased stored tabs when a hibernated group was given a pane.
+			if (!isBlankTab(tab)) continue;
+			entries.push({ kind: 'pruneTab', tabId: tab.id });
 		}
 
 		const liveTabs: SpaceNode[] = [];
@@ -296,7 +391,8 @@ export function plan(
 		);
 		let order = 0;
 		for (const tab of [...liveTabs, ...rest]) {
-			entries.push({ kind: 'setOrder', tabId: tab.id, order: order++ });
+			if (tab.order !== order) entries.push({ kind: 'setOrder', tabId: tab.id, order });
+			order += 1;
 		}
 	}
 
@@ -326,9 +422,16 @@ export function plan(
 		entries.push({ kind: 'removeGroup', groupId: g.id });
 	}
 
-	// 6. New groups for still-unclaimed panes
+	// 6. New groups for still-unclaimed panes.
+	// A leaf whose record sits in a section pool stays that record. It does not
+	// spawn another tab, and a pane of only pooled leaves does not spawn a group.
 	for (const pane of snapshot.panes) {
 		if (claimByPane.has(pane.paneId)) continue;
+		const freshLeaves = pane.leaves.filter((leaf) => {
+			const existing = tabByKey.get(leaf.identity.key);
+			return !(existing && isSectionPool(nodes, existing));
+		});
+		if (freshLeaves.length === 0) continue;
 		entries.push({
 			kind: 'newGroup',
 			paneId: pane.paneId,
@@ -336,7 +439,10 @@ export function plan(
 			title: ctx.nextDefaultTitle(),
 		});
 		const gid = pendingGroupId(pane.paneId);
-		for (const leaf of pane.leaves) {
+		const seen = new Set<string>();
+		for (const leaf of freshLeaves) {
+			if (seen.has(leaf.identity.key)) continue;
+			seen.add(leaf.identity.key);
 			entries.push({
 				kind: 'addTab',
 				groupId: gid,
@@ -347,6 +453,27 @@ export function plan(
 			});
 		}
 		claimByPane.set(pane.paneId, gid);
+	}
+
+	// One tab key, one row, inside a single group. Keep the record membership
+	// already resolved (tabByKey) and drop the extra copies.
+	for (const group of groups) {
+		const keeper = new Map<string, string>();
+		for (const tab of childrenOf(nodes, group.id)) {
+			if (!tab.tabKey) continue;
+			const kept = keeper.get(tab.tabKey);
+			if (!kept) {
+				keeper.set(tab.tabKey, tab.id);
+				continue;
+			}
+			const resolved = tabByKey.get(tab.tabKey)?.id;
+			if (resolved === tab.id) {
+				entries.push({ kind: 'pruneTab', tabId: kept });
+				keeper.set(tab.tabKey, tab.id);
+			} else {
+				entries.push({ kind: 'pruneTab', tabId: tab.id });
+			}
+		}
 	}
 
 	return entries;

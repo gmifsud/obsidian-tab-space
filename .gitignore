@@ -13,3 +13,7 @@ data.json
 .gemini/.agentforge-skills.json
 .cursor/skills
 .cursor/.agentforge-skills.json
+
+# Local Working tabs deployment targets
+working-tabs-deploy.local.json
+.test-output/

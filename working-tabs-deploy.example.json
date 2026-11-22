@@ -1,0 +1,11 @@
+{
+  "$schema": "./deploy-config.schema.json",
+  "backup": true,
+  "vaults": [
+    {
+      "name": "Example vault",
+      "path": "D:/Vaults/My Obsidian Vault",
+      "enabled": false
+    }
+  ]
+}

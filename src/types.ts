@@ -92,6 +92,9 @@ export interface SpaceNode {
 	 * section. Never shown to the user as a choice; picking any colour writes
 	 * `color` instead, and "Automatic" clears that to fall back here. */
 	autoColor?: ColorSlot;
+	/** Automatic hue, 0–359. Assigned so groups that have not picked a colour
+	 * stay as far apart as the set allows. Explicit `color` picks do not use this. */
+	autoHue?: number;
 
 	/** Tabs only -- internal matching key used by reconcile to tell "same tab, still
 	 * open" apart from "closed". Equals filePath for note/file tabs (stable across
@@ -118,6 +121,13 @@ export interface SpaceNode {
 	completedAt?: number;
 	/** Groups only -- where to restore to if its original section/parent is gone. */
 	lastParentId?: string | null;
+
+	/** Tabs only. Set when the tab is filed in a section pool, so Return can
+	 * put the row back in the group it left. Cleared when Send to a group
+	 * makes that group the new home. */
+	originGroupId?: string;
+	/** Index among the origin group's children at the time it was pooled. */
+	originOrder?: number;
 }
 
 /** Reserved parentId value for the Completed bucket, so it reuses the same node
