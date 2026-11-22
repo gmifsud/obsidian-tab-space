@@ -1050,6 +1050,27 @@ export class TabSpacesView extends ItemView {
 		return false;
 	}
 
+	/** True when `ancestor` is `node` itself or one of its ancestors. */
+	private isSelfOrAncestor(ancestor: SpaceNode, node: SpaceNode): boolean {
+		let current: SpaceNode | undefined = node;
+		while (current) {
+			if (current.id === ancestor.id) return true;
+			current = current.parentId ? this.store.find(current.parentId) : undefined;
+		}
+		return false;
+	}
+
+	/** Groups can be merged into other groups (tabs move across, source is removed). */
+	private canMergeInto(dragged: SpaceNode, target: SpaceNode): boolean {
+		return (
+			dragged.type === 'group' &&
+			target.type === 'group' &&
+			dragged.parentId !== COMPLETED_PARENT_ID &&
+			target.parentId !== COMPLETED_PARENT_ID &&
+			!this.isSelfOrAncestor(dragged, target)
+		);
+	}
+
 	private wireDrag(row: HTMLElement, node: SpaceNode): void {
 		row.addEventListener('dragstart', (evt) => {
 			this.draggedId = node.id;
@@ -1090,7 +1111,9 @@ export class TabSpacesView extends ItemView {
 		}
 		const rect = row.getBoundingClientRect();
 		const fraction = (evt.clientY - rect.top) / rect.height;
-		const canNestInto = (target.type === 'group' || target.type === 'section') && this.canDropAt(dragged, target.id);
+		const canNestInto =
+			(target.type === 'group' || target.type === 'section') &&
+			(this.canDropAt(dragged, target.id) || this.canMergeInto(dragged, target));
 		if (canNestInto && fraction > 0.25 && fraction < 0.75) return 'into';
 		if (!this.canDropAt(dragged, target.parentId)) return canNestInto ? 'into' : null;
 		return fraction < 0.5 ? 'before' : 'after';
@@ -1133,6 +1156,12 @@ export class TabSpacesView extends ItemView {
 		}
 
 		if (position === 'into') {
+			// Dropping a group "into" another group merges its tabs into the
+			// target and removes the source — it must not nest groups.
+			if (dragged.type === 'group' && target.type === 'group') {
+				await this.plugin.leafSync.mergeGroupIntoTarget(dragged.id, target.id);
+				return;
+			}
 			const index = this.store.children(target.id).filter((n) => n.id !== dragged.id).length;
 			await this.store.moveInto(dragged.id, target.id, index);
 			return;

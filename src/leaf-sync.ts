@@ -2,7 +2,7 @@ import { Notice, TFile, WorkspaceLeaf, type ViewState } from 'obsidian';
 import type TabSpacesPlugin from './main';
 import type { TabSpacesStore } from './store';
 import type { OpenBehavior, SpaceNode } from './types';
-import { VIEW_TYPE_WORKING_TABS } from './types';
+import { COMPLETED_PARENT_ID, VIEW_TYPE_WORKING_TABS } from './types';
 import {
 	effectivelyHidden,
 	pendingGroupId,
@@ -605,14 +605,9 @@ export class LeafSync {
 		const editor = this.editorLeaf();
 		const neighbor = this.findEdgeAnchor(edge, leaves);
 		const beside = Boolean(neighbor);
-		const orientation: SplitDirectionName = beside
-			? edge === 'top' || edge === 'bottom'
-				? 'vertical'
-				: 'horizontal'
-			: edge === 'left' || edge === 'right'
-				? 'vertical'
-				: 'horizontal';
-		const before = !beside && (edge === 'left' || edge === 'top');
+		const orientation: SplitDirectionName =
+			edge === 'top' || edge === 'bottom' ? 'horizontal' : 'vertical';
+		const before = edge === 'left' || edge === 'top';
 		const basis = neighbor ?? (editor && !leaves.includes(editor) ? editor : leaves[0] ?? editor);
 		if (!basis && closed.length === 0) return null;
 		const anchor = basis ?? this.workspace.getLeaf('tab');
@@ -1018,7 +1013,7 @@ export class LeafSync {
 		const targetLeaf = this.findLeafInPane(targetPaneId);
 		if (!targetLeaf) return;
 
-		const tabs = this.store.children(sourceId).filter((t) => t.viewState || t.filePath);
+		const tabs = this.store.children(sourceId).filter((t) => t.type === 'tab');
 		if (tabs.length === 0) return;
 		const tabIds = tabs.map((t) => t.id);
 		const fromSnapshot: SpaceNode = { ...group };
@@ -1045,6 +1040,54 @@ export class LeafSync {
 		} finally {
 			this.openingGroups.delete(sourceId);
 			this.openingGroups.delete(owner.id);
+		}
+	}
+
+	/**
+	 * Merge one group into another by moving every tab record across, then
+	 * removing the source group. Used by drag-and-drop when a group is dropped
+	 * onto another group. Works whether either group is live or hibernated:
+	 * sendToGroup only opens leaves when the target is live. Keeps the same
+	 * Undo receipt as mergeGroupInto.
+	 */
+	async mergeGroupIntoTarget(sourceId: string, targetId: string): Promise<void> {
+		if (sourceId === targetId) return;
+		const group = this.store.find(sourceId);
+		const target = this.store.find(targetId);
+		if (!group || group.type !== 'group') return;
+		if (!target || target.type !== 'group') return;
+		if (group.parentId === COMPLETED_PARENT_ID || target.parentId === COMPLETED_PARENT_ID) return;
+
+		// Refuse to merge a group into itself or one of its own descendants.
+		let cursor: SpaceNode | undefined = target;
+		while (cursor) {
+			if (cursor.id === sourceId) return;
+			cursor = cursor.parentId ? this.store.find(cursor.parentId) : undefined;
+		}
+
+		const tabs = this.store.children(sourceId).filter((t) => t.type === 'tab');
+		const tabIds = tabs.map((t) => t.id);
+		const fromSnapshot: SpaceNode = { ...group };
+
+		this.openingGroups.add(sourceId);
+		this.openingGroups.add(target.id);
+		try {
+			if (group.homePaneId && this.findLeafInPane(group.homePaneId)) await this.closeGroup(sourceId);
+			if (tabs.length > 0) await this.sendToGroup(tabs, target.id);
+			await this.store.remove(sourceId);
+			if (tabs.length === 0) return;
+			const receipt = {
+				group: fromSnapshot,
+				tabIds,
+				targetGroupId: target.id,
+				at: Date.now(),
+			};
+			this.receipts.unshift(receipt);
+			if (this.receipts.length > 5) this.receipts.length = 5;
+			this.showMergeNotice(fromSnapshot.title, target.title, receipt);
+		} finally {
+			this.openingGroups.delete(sourceId);
+			this.openingGroups.delete(target.id);
 		}
 	}
 

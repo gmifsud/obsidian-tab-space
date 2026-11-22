@@ -1744,8 +1744,8 @@ var LeafSync = class {
     const editor = this.editorLeaf();
     const neighbor = this.findEdgeAnchor(edge, leaves);
     const beside = Boolean(neighbor);
-    const orientation = beside ? edge === "top" || edge === "bottom" ? "vertical" : "horizontal" : edge === "left" || edge === "right" ? "vertical" : "horizontal";
-    const before = !beside && (edge === "left" || edge === "top");
+    const orientation = edge === "top" || edge === "bottom" ? "horizontal" : "vertical";
+    const before = edge === "left" || edge === "top";
     const basis = neighbor != null ? neighbor : editor && !leaves.includes(editor) ? editor : (_a = leaves[0]) != null ? _a : editor;
     if (!basis && closed.length === 0)
       return null;
@@ -2151,7 +2151,7 @@ var LeafSync = class {
     const targetLeaf = this.findLeafInPane(targetPaneId);
     if (!targetLeaf)
       return;
-    const tabs = this.store.children(sourceId).filter((t) => t.viewState || t.filePath);
+    const tabs = this.store.children(sourceId).filter((t) => t.type === "tab");
     if (tabs.length === 0)
       return;
     const tabIds = tabs.map((t) => t.id);
@@ -2180,6 +2180,58 @@ var LeafSync = class {
     } finally {
       this.openingGroups.delete(sourceId);
       this.openingGroups.delete(owner.id);
+    }
+  }
+  /**
+   * Merge one group into another by moving every tab record across, then
+   * removing the source group. Used by drag-and-drop when a group is dropped
+   * onto another group. Works whether either group is live or hibernated:
+   * sendToGroup only opens leaves when the target is live. Keeps the same
+   * Undo receipt as mergeGroupInto.
+   */
+  async mergeGroupIntoTarget(sourceId, targetId) {
+    if (sourceId === targetId)
+      return;
+    const group = this.store.find(sourceId);
+    const target = this.store.find(targetId);
+    if (!group || group.type !== "group")
+      return;
+    if (!target || target.type !== "group")
+      return;
+    if (group.parentId === COMPLETED_PARENT_ID || target.parentId === COMPLETED_PARENT_ID)
+      return;
+    let cursor = target;
+    while (cursor) {
+      if (cursor.id === sourceId)
+        return;
+      cursor = cursor.parentId ? this.store.find(cursor.parentId) : void 0;
+    }
+    const tabs = this.store.children(sourceId).filter((t) => t.type === "tab");
+    const tabIds = tabs.map((t) => t.id);
+    const fromSnapshot = { ...group };
+    this.openingGroups.add(sourceId);
+    this.openingGroups.add(target.id);
+    try {
+      if (group.homePaneId && this.findLeafInPane(group.homePaneId))
+        await this.closeGroup(sourceId);
+      if (tabs.length > 0)
+        await this.sendToGroup(tabs, target.id);
+      await this.store.remove(sourceId);
+      if (tabs.length === 0)
+        return;
+      const receipt = {
+        group: fromSnapshot,
+        tabIds,
+        targetGroupId: target.id,
+        at: Date.now()
+      };
+      this.receipts.unshift(receipt);
+      if (this.receipts.length > 5)
+        this.receipts.length = 5;
+      this.showMergeNotice(fromSnapshot.title, target.title, receipt);
+    } finally {
+      this.openingGroups.delete(sourceId);
+      this.openingGroups.delete(target.id);
     }
   }
   showMergeNotice(fromTitle, toTitle, receipt) {
@@ -3588,6 +3640,20 @@ var TabSpacesView = class extends import_obsidian6.ItemView {
       return dragged.type === "tab";
     return false;
   }
+  /** True when `ancestor` is `node` itself or one of its ancestors. */
+  isSelfOrAncestor(ancestor, node) {
+    let current = node;
+    while (current) {
+      if (current.id === ancestor.id)
+        return true;
+      current = current.parentId ? this.store.find(current.parentId) : void 0;
+    }
+    return false;
+  }
+  /** Groups can be merged into other groups (tabs move across, source is removed). */
+  canMergeInto(dragged, target) {
+    return dragged.type === "group" && target.type === "group" && dragged.parentId !== COMPLETED_PARENT_ID && target.parentId !== COMPLETED_PARENT_ID && !this.isSelfOrAncestor(dragged, target);
+  }
   wireDrag(row, node) {
     row.addEventListener("dragstart", (evt) => {
       var _a;
@@ -3633,7 +3699,7 @@ var TabSpacesView = class extends import_obsidian6.ItemView {
     }
     const rect = row.getBoundingClientRect();
     const fraction = (evt.clientY - rect.top) / rect.height;
-    const canNestInto = (target.type === "group" || target.type === "section") && this.canDropAt(dragged, target.id);
+    const canNestInto = (target.type === "group" || target.type === "section") && (this.canDropAt(dragged, target.id) || this.canMergeInto(dragged, target));
     if (canNestInto && fraction > 0.25 && fraction < 0.75)
       return "into";
     if (!this.canDropAt(dragged, target.parentId))
@@ -3680,6 +3746,10 @@ var TabSpacesView = class extends import_obsidian6.ItemView {
       return;
     }
     if (position === "into") {
+      if (dragged.type === "group" && target.type === "group") {
+        await this.plugin.leafSync.mergeGroupIntoTarget(dragged.id, target.id);
+        return;
+      }
       const index2 = this.store.children(target.id).filter((n) => n.id !== dragged.id).length;
       await this.store.moveInto(dragged.id, target.id, index2);
       return;
