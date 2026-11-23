@@ -371,9 +371,10 @@ export function plan(
 			if (effectiveParent.get(tab.id) !== groupId) continue;
 			if (movedTabIds.has(tab.id)) continue;
 			if (tab.tabKey && paneKeySet.has(tab.tabKey)) continue;
-			// A note that is not open yet still belongs to the group. Dropping it
-			// here is what erased stored tabs when a hibernated group was given a pane.
-			if (!isBlankTab(tab)) continue;
+			// Once the group has an established live claim, the pane is the source
+			// of truth. A missing record is a closed tab and leaving it here creates
+			// a clickable phantom row. Fresh claims and dormant groups are protected
+			// by the guards above, and deliberately completed tabs remain stored.
 			entries.push({ kind: 'pruneTab', tabId: tab.id });
 		}
 

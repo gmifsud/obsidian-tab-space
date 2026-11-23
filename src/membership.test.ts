@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import type { SpaceNode } from './types';
 import {
 	effectivelyHidden,
-	pendingGroupId,
 	plan,
 	type PlanContext,
 	type PlanEntry,
@@ -338,15 +337,15 @@ describe('plan()', () => {
 		expect(ofKind(entries, 'addTab')).toHaveLength(0);
 	});
 
-	it('keeps a stored tab that is not open in the live pane', () => {
+	it('prunes a stored tab that is no longer open in its live pane', () => {
 		const nodes = [
 			group('footer', { homePaneId: 'p1' }),
 			tab('open1', 'footer', 'a.md', { order: 0 }),
 			tab('open2', 'footer', 'b.md', { order: 1 }),
-			tab('kept', 'footer', 'c.md', { order: 2 }),
+			tab('stale', 'footer', 'c.md', { order: 2 }),
 		];
 		const entries = plan(snap([pane('p1', [{ key: 'a.md' }, { key: 'b.md' }])]), nodes, ctx());
-		expect(ofKind(entries, 'pruneTab').some((entry) => entry.tabId === 'kept')).toBe(false);
+		expect(ofKind(entries, 'pruneTab').map((entry) => entry.tabId)).toEqual(['stale']);
 	});
 
 	it('does not add another copy when the live group already has the tab', () => {

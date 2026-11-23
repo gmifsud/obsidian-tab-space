@@ -990,8 +990,6 @@ function plan(snapshot, nodes, ctx) {
         continue;
       if (tab.tabKey && paneKeySet.has(tab.tabKey))
         continue;
-      if (!isBlankTab(tab))
-        continue;
       entries.push({ kind: "pruneTab", tabId: tab.id });
     }
     const liveTabs = [];
